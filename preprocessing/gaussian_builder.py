@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 import json
 from typing import Optional
+import time
 
 # Optional (fast CPU KNN)
 try:
@@ -39,20 +40,22 @@ def log(msg: str):
 # Sampling strategy (ONLY random downsample)
 # ==============================
 SAMPLE_MODE = "random"   # enforced random
-MAX_GAUSSIANS = 4_000_000
+MAX_GAUSSIANS = -1
 MAX_GAUSSIANS_AFTER_SAMPLING = MAX_GAUSSIANS
 
 # KNN
 K_NEIGHBORS_ISO = 8
 K_NEIGHBORS_NORMAL = 24
 K_NEIGHBORS_TANGENT = 64
+KNN_BACKEND = "auto"   # auto | cuda | cpu
+KNN_QUERY_BATCH = 262144
+FRAME_TRANSFORM_BACKEND = "auto"  # auto | cuda | cpu
 
 # ==============================
 # Normals strategy (B): prefer file normals
 # ==============================
-USE_FILE_NORMALS_FIRST = True     # ← 핵심：优先用文件 normals
-ALLOW_O3D_ESTIMATE_NORMALS = True # 文件没有 normals 才允许算
-# 注意：你现在 PLY 有 normals，因此不会走 estimate_normals()
+USE_FILE_NORMALS_FIRST = True
+ALLOW_O3D_ESTIMATE_NORMALS = True
 
 # ==============================
 # Batch anisotropy (million+ points)
@@ -144,7 +147,6 @@ CHUNK_EPS = 1e-5
 
 
 def apply_preset(preset: str):
-    """verify/final 现在只负责 max_points 与一些参数，不再改 sampling 模式（永远 random）"""
     global PRESET
     global MAX_GAUSSIANS, MAX_GAUSSIANS_AFTER_SAMPLING
     global TANGENT_WEIGHT_SIGMA_FACTOR, TANGENT_WEIGHT_SIGMA_W_MAX
@@ -157,8 +159,7 @@ def apply_preset(preset: str):
     PRESET = p
 
     if p == "verify":
-        # 小数据验证：更保守的参数
-        MAX_GAUSSIANS = 4_433_050  # 你之前看到的 N=4433050 就是它
+        MAX_GAUSSIANS = 4_433_050
         MAX_GAUSSIANS_AFTER_SAMPLING = MAX_GAUSSIANS
 
         TANGENT_WEIGHT_SIGMA_FACTOR = 1.0
@@ -176,7 +177,6 @@ def apply_preset(preset: str):
         SIGMA_N_FIXED = 0.006
 
     elif p == "final":
-        # 全量：默认不限制点数（-1=all），但你也可以用 --max_points 覆盖
         MAX_GAUSSIANS = -1
         MAX_GAUSSIANS_AFTER_SAMPLING = -1
 
@@ -243,26 +243,96 @@ def mat_to_cov6(Sigma: np.ndarray) -> np.ndarray:
 def apply_frame_transform(points: np.ndarray,
                           rotations: np.ndarray,
                           cov6: np.ndarray,
-                          M: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    pts_t = (points @ M.T).astype(np.float32)
+                          M: np.ndarray,
+                          backend: str = FRAME_TRANSFORM_BACKEND) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _cpu_vectorized() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        M32 = M.astype(np.float32, copy=False)
+        MT32 = M32.T
 
-    R = rotations.reshape(-1, 3, 3).astype(np.float32)
-    R_t = (M.astype(np.float32) @ R).astype(np.float32)
-    for i in range(R_t.shape[0]):
-        R_t[i] = orthonormalize_rotation(R_t[i])
-    rot_t = R_t.reshape(-1, 9).astype(np.float32)
+        pts_t_cpu = (points @ MT32).astype(np.float32)
 
-    cov_t = np.zeros_like(cov6, dtype=np.float32)
-    MT = M.T.astype(np.float32)
-    for i in range(cov6.shape[0]):
-        Sigma = cov6_to_mat(cov6[i])
-        Sigma_t = (M @ Sigma @ MT).astype(np.float32)
-        cov_t[i] = mat_to_cov6(Sigma_t)
+        R = rotations.reshape(-1, 3, 3).astype(np.float32)
+        R_t_cpu = np.einsum('ij,bjk->bik', M32, R, optimize=True).astype(np.float32)
+        rot_t_cpu = R_t_cpu.reshape(-1, 9).astype(np.float32)
 
-    return pts_t, rot_t, cov_t
+        xx, xy, xz, yy, yz, zz = [cov6[:, i].astype(np.float32, copy=False) for i in range(6)]
+        Sigma = np.empty((cov6.shape[0], 3, 3), dtype=np.float32)
+        Sigma[:, 0, 0] = xx
+        Sigma[:, 0, 1] = xy
+        Sigma[:, 0, 2] = xz
+        Sigma[:, 1, 0] = xy
+        Sigma[:, 1, 1] = yy
+        Sigma[:, 1, 2] = yz
+        Sigma[:, 2, 0] = xz
+        Sigma[:, 2, 1] = yz
+        Sigma[:, 2, 2] = zz
+
+        Sigma_t = np.einsum('ij,bjk,kl->bil', M32, Sigma, MT32, optimize=True).astype(np.float32)
+        cov_t_cpu = np.empty_like(cov6, dtype=np.float32)
+        cov_t_cpu[:, 0] = Sigma_t[:, 0, 0]
+        cov_t_cpu[:, 1] = Sigma_t[:, 0, 1]
+        cov_t_cpu[:, 2] = Sigma_t[:, 0, 2]
+        cov_t_cpu[:, 3] = Sigma_t[:, 1, 1]
+        cov_t_cpu[:, 4] = Sigma_t[:, 1, 2]
+        cov_t_cpu[:, 5] = Sigma_t[:, 2, 2]
+
+        return pts_t_cpu, rot_t_cpu, cov_t_cpu
+
+    b = (backend or "auto").lower().strip()
+    if b not in ("auto", "cuda", "cpu"):
+        b = "auto"
+
+    if b in ("auto", "cuda"):
+        try:
+            if o3d.core.cuda.is_available():
+                log("[INFO] Frame transform backend: Open3D Tensor CUDA")
+                dev = o3d.core.Device("CUDA:0")
+
+                M32 = M.astype(np.float32, copy=False)
+                t_M = o3d.core.Tensor(M32, dtype=o3d.core.Dtype.Float32, device=dev)
+                t_MT = t_M.transpose(0, 1)
+
+                t_pts = o3d.core.Tensor(np.asarray(points, dtype=np.float32), dtype=o3d.core.Dtype.Float32, device=dev)
+                pts_t = t_pts.matmul(t_MT).cpu().numpy().astype(np.float32, copy=False)
+
+                R_np = np.asarray(rotations, dtype=np.float32).reshape(-1, 3, 3)
+                t_R = o3d.core.Tensor(R_np, dtype=o3d.core.Dtype.Float32, device=dev)
+                R_t = t_M.matmul(t_R).cpu().numpy().astype(np.float32, copy=False)
+                rot_t = R_t.reshape(-1, 9).astype(np.float32, copy=False)
+
+                xx, xy, xz, yy, yz, zz = [np.asarray(cov6[:, i], dtype=np.float32) for i in range(6)]
+                Sigma = np.empty((cov6.shape[0], 3, 3), dtype=np.float32)
+                Sigma[:, 0, 0] = xx
+                Sigma[:, 0, 1] = xy
+                Sigma[:, 0, 2] = xz
+                Sigma[:, 1, 0] = xy
+                Sigma[:, 1, 1] = yy
+                Sigma[:, 1, 2] = yz
+                Sigma[:, 2, 0] = xz
+                Sigma[:, 2, 1] = yz
+                Sigma[:, 2, 2] = zz
+
+                t_Sigma = o3d.core.Tensor(Sigma, dtype=o3d.core.Dtype.Float32, device=dev)
+                Sigma_t = t_M.matmul(t_Sigma).matmul(t_MT).cpu().numpy().astype(np.float32, copy=False)
+
+                cov_t = np.empty_like(cov6, dtype=np.float32)
+                cov_t[:, 0] = Sigma_t[:, 0, 0]
+                cov_t[:, 1] = Sigma_t[:, 0, 1]
+                cov_t[:, 2] = Sigma_t[:, 0, 2]
+                cov_t[:, 3] = Sigma_t[:, 1, 1]
+                cov_t[:, 4] = Sigma_t[:, 1, 2]
+                cov_t[:, 5] = Sigma_t[:, 2, 2]
+
+                return pts_t, rot_t, cov_t
+            elif b == "cuda":
+                log("[WARN] Frame transform requested CUDA but CUDA unavailable; falling back to CPU.")
+        except Exception as e:
+            log(f"[WARN] Frame transform CUDA path failed: {e}; falling back to CPU.")
+
+    log("[INFO] Frame transform backend: NumPy CPU")
+    return _cpu_vectorized()
 
 
-# ---- Random sampling that preserves normals/colors by select_by_index ----
 def random_downsample_pcd(pcd: o3d.geometry.PointCloud, max_points: int) -> o3d.geometry.PointCloud:
     n = np.asarray(pcd.points).shape[0]
     if max_points is None or max_points <= 0 or n <= max_points:
@@ -271,8 +341,10 @@ def random_downsample_pcd(pcd: o3d.geometry.PointCloud, max_points: int) -> o3d.
     return pcd.select_by_index(idx)
 
 
-# ---- Fast batched KNN (Open3D Tensor NNS) ----
-def batch_knn_search(points_np: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+def batch_knn_search(points_np: np.ndarray,
+                     k: int,
+                     backend: str = KNN_BACKEND,
+                     query_batch: int = KNN_QUERY_BATCH) -> tuple[np.ndarray, np.ndarray]:
     k = int(k)
     if k <= 0:
         raise ValueError("k must be > 0")
@@ -280,19 +352,45 @@ def batch_knn_search(points_np: np.ndarray, k: int) -> tuple[np.ndarray, np.ndar
     pts = np.asarray(points_np, dtype=np.float32)
     n = pts.shape[0]
 
-    try:
-        import open3d as _o3d
-        t_pts = _o3d.core.Tensor(pts, dtype=_o3d.core.Dtype.Float32)
-        nns = _o3d.core.nns.NearestNeighborSearch(t_pts)
-        nns.knn_index()
-        idx_t, dist2_t = nns.knn_search(t_pts, k)
-        idx = idx_t.numpy().astype(np.int64, copy=False)
-        dist2 = dist2_t.numpy().astype(np.float64, copy=False)
-        return idx, dist2
-    except Exception:
-        pass
+    backend = (backend or "auto").lower().strip()
+    query_batch = int(max(1, query_batch))
 
-    log("[WARN] Open3D tensor NNS not available; falling back to KDTreeFlann loop (slow).")
+    def _try_tensor_knn(device):
+        t_pts = o3d.core.Tensor(pts, dtype=o3d.core.Dtype.Float32, device=device)
+        nns = o3d.core.nns.NearestNeighborSearch(t_pts)
+        nns.knn_index()
+
+        idx_out = np.empty((n, k), dtype=np.int64)
+        dist2_out = np.empty((n, k), dtype=np.float64)
+
+        for b0 in range(0, n, query_batch):
+            b1 = min(n, b0 + query_batch)
+            q = t_pts[b0:b1]
+            idx_t, dist2_t = nns.knn_search(q, k)
+            idx_out[b0:b1] = idx_t.cpu().numpy().astype(np.int64, copy=False)
+            dist2_out[b0:b1] = dist2_t.cpu().numpy().astype(np.float64, copy=False)
+
+        return idx_out, dist2_out
+
+    if backend not in ("auto", "cuda", "cpu"):
+        backend = "auto"
+
+    if backend in ("auto", "cuda"):
+        try:
+            if o3d.core.cuda.is_available():
+                log("[INFO] KNN backend: Open3D Tensor CUDA")
+                return _try_tensor_knn(o3d.core.Device("CUDA:0"))
+            elif backend == "cuda":
+                log("[WARN] Requested CUDA KNN, but CUDA is unavailable; falling back.")
+        except Exception as e:
+            log(f"[WARN] CUDA Tensor KNN failed: {e}; falling back.")
+
+    try:
+        log("[INFO] KNN backend: Open3D Tensor CPU")
+        return _try_tensor_knn(o3d.core.Device("CPU:0"))
+    except Exception as e:
+        log(f"[WARN] Open3D tensor NNS unavailable: {e}; falling back to KDTreeFlann loop (slow).")
+
     pcd_tmp = o3d.geometry.PointCloud()
     pcd_tmp.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
     kdt = o3d.geometry.KDTreeFlann(pcd_tmp)
@@ -333,7 +431,6 @@ def compute_isotropic_scales(points, kdtree, k_neighbors,
                 f"p95={np.percentile(dist_arr, 95):.4f}, max={dist_arr.max():.4f}, mean={dist_arr.mean():.4f}")
         return scales_iso
 
-    # slow fallback
     dist_list = []
     for i in range(num):
         k, idx, dist2 = kdtree.search_knn_vector_3d(points[i], k_neighbors)
@@ -427,9 +524,11 @@ def compute_normal_aligned_gaussians_batched(points: np.ndarray,
                                              scales_iso: np.ndarray,
                                              normals: np.ndarray,
                                              k_tangent: int = K_NEIGHBORS_TANGENT,
-                                             block_size: int = 50000) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if not _HAS_SCIPY:
-        raise RuntimeError("SciPy not available (cKDTree missing). Set --no_batch_aniso or install scipy.")
+                                             block_size: int = 50000,
+                                             knn_idx_all: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    use_cached_knn = knn_idx_all is not None
+    if (not use_cached_knn) and (not _HAS_SCIPY):
+        raise RuntimeError("SciPy not available and no cached KNN provided.")
 
     pts = np.asarray(points, dtype=np.float32)
     N = pts.shape[0]
@@ -448,9 +547,13 @@ def compute_normal_aligned_gaussians_batched(points: np.ndarray,
     rotations = np.zeros((N, 9), dtype=np.float32)
     cov6 = np.zeros((N, 6), dtype=np.float32)
 
-    tree = cKDTree(pts)
+    tree = cKDTree(pts) if not use_cached_knn else None
 
-    log("[INFO] Step 6 (BATCH): cKDTree KNN + numpy broadcasting...")
+    log("[INFO] Step 6 (BATCH): anisotropy + numpy broadcasting...")
+    if use_cached_knn:
+        log("[INFO] Step 6 KNN source: cached batched KNN")
+    else:
+        log("[INFO] Step 6 KNN source: SciPy cKDTree query")
     log(f"[INFO] N={N}, k_tangent={k}, block_size={block_size}")
 
     q = float(DT_PERCENTILE)
@@ -463,8 +566,13 @@ def compute_normal_aligned_gaussians_batched(points: np.ndarray,
         n = nrm[b0:b1]
         s_iso = scales_iso[b0:b1].astype(np.float32, copy=False)
 
-        d, idx = tree.query(p, k=k, workers=-1)
-        idx = idx.astype(np.int64, copy=False)
+        if use_cached_knn:
+            idx = np.asarray(knn_idx_all[b0:b1, :k], dtype=np.int64)
+            if idx.shape[1] < k:
+                raise RuntimeError(f"Cached KNN has insufficient columns: need {k}, got {idx.shape[1]}")
+        else:
+            _d, idx = tree.query(p, k=k, workers=-1)
+            idx = idx.astype(np.int64, copy=False)
 
         idx_n = idx[:, 1:]
         neigh = pts[idx_n]
@@ -665,6 +773,10 @@ def write_chunks_from_arrays(P: np.ndarray,
 
 
 def main():
+    t_start = time.perf_counter()
+    stage_times: dict[str, float] = {}
+
+    t_stage = time.perf_counter()
     log(f"[INFO] Loading point cloud from: {INPUT_PATH}")
     if not INPUT_PATH.exists():
         raise FileNotFoundError(f"Input file not found: {INPUT_PATH}")
@@ -674,8 +786,9 @@ def main():
         raise RuntimeError("Open3D loaded empty point cloud. Check file path/format.")
 
     log(f"[INFO] Loaded {np.asarray(pcd.points).shape[0]} points")
+    stage_times["load_pcd"] = time.perf_counter() - t_stage
 
-    # ---- Pre-shift ----
+    t_stage = time.perf_counter()
     origin_pre_shift = np.zeros((3,), dtype=np.float32)
     if ENABLE_PRE_SHIFT:
         pts0 = np.asarray(pcd.points).astype(np.float64)
@@ -684,8 +797,9 @@ def main():
         log("[INFO] Pre-shift enabled (float precision fix):")
         log(f"  PRE_SHIFT_MODE={PRE_SHIFT_MODE}")
         log(f"  origin_pre_shift (input frame) = [{origin_pre_shift[0]:.3f}, {origin_pre_shift[1]:.3f}, {origin_pre_shift[2]:.3f}]")
+    stage_times["pre_shift"] = time.perf_counter() - t_stage
 
-    # ---- Random downsample (preserve normals/colors by select_by_index) ----
+    t_stage = time.perf_counter()
     num_points_full = np.asarray(pcd.points).shape[0]
     pcd_proc = random_downsample_pcd(pcd, MAX_GAUSSIANS)
     proc_n = np.asarray(pcd_proc.points).shape[0]
@@ -698,14 +812,12 @@ def main():
 
     log(f"[INFO] Sampling mode=random, full={num_points_full} -> processed={proc_n}")
 
-    # ---- Extract arrays ----
     points = np.asarray(pcd_proc.points).astype(np.float32, copy=False)
     colors = np.asarray(pcd_proc.colors).astype(np.float32, copy=False)
 
     if colors.size > 0 and colors.max() > 1.1:
         colors = colors / 255.0
 
-    # ---- Normals: prefer file normals (B) ----
     normals = None
     if USE_FILE_NORMALS_FIRST and pcd_proc.has_normals():
         normals = np.asarray(pcd_proc.normals).astype(np.float32, copy=False)
@@ -717,18 +829,20 @@ def main():
         normals = np.asarray(pcd_proc.normals).astype(np.float32, copy=False)
     else:
         raise RuntimeError("No normals in file and estimation disabled.")
+    stage_times["sampling_and_normals"] = time.perf_counter() - t_stage
 
-    # ---- KDTree for fallback pieces + cached KNN ----
+    t_stage = time.perf_counter()
     log("[INFO] Building KDTree...")
     kdtree = o3d.geometry.KDTreeFlann(pcd_proc)
 
     K_MAX_CACHE = int(max(K_NEIGHBORS_ISO, K_NEIGHBORS_NORMAL, K_NEIGHBORS_TANGENT) + 1)
     log(f"[INFO] Building cached batched KNN (K={K_MAX_CACHE})...")
-    knn_idx_all, knn_dist2_all = batch_knn_search(points, K_MAX_CACHE)
+    knn_idx_all, knn_dist2_all = batch_knn_search(points, K_MAX_CACHE, backend=KNN_BACKEND, query_batch=KNN_QUERY_BATCH)
 
     scales_iso = compute_isotropic_scales(points, kdtree, K_NEIGHBORS_ISO, knn_idx_all, knn_dist2_all)
+    stage_times["knn_and_iso"] = time.perf_counter() - t_stage
 
-    # ---- Adaptive clamp ----
+    t_stage = time.perf_counter()
     global S_MIN, S_MAX
     if USE_ADAPTIVE_CLAMP:
         S_MIN, S_MAX = compute_adaptive_clamp(scales_iso)
@@ -739,30 +853,32 @@ def main():
         log("[INFO] Adaptive clamp disabled:")
         log(f"  Using fixed S_MIN={S_MIN:.4f} m, S_MAX={S_MAX:.4f} m")
 
-    # ---- S_MAX policy (keep your previous logic, simplified) ----
-    # 这里保留你的策略结构，但不再重复 estimate_dt_distribution（你可之后再加回去）
     if S_MAX <= S_MIN:
         S_MAX = float(min(ABS_S_MAX, S_MIN * 2.0))
         log(f"[WARN] Adjusted S_MAX to keep it > S_MIN: S_MAX={S_MAX:.4f} m")
+    stage_times["adaptive_clamp"] = time.perf_counter() - t_stage
 
-    # ---- Step 6 batched aniso ----
-    if USE_BATCH_ANISO and _HAS_SCIPY:
+    t_stage = time.perf_counter()
+    if USE_BATCH_ANISO:
         scales_aniso, rotations, cov6 = compute_normal_aligned_gaussians_batched(
             points=points,
             scales_iso=scales_iso,
             normals=normals,
             k_tangent=K_NEIGHBORS_TANGENT,
             block_size=ANISO_BLOCK_SIZE,
+            knn_idx_all=knn_idx_all,
         )
     else:
         raise RuntimeError("This script version expects SciPy batched anisotropy. Install scipy or extend fallback path.")
+    stage_times["anisotropy"] = time.perf_counter() - t_stage
 
-    # ---- Frame transform ----
+    t_stage = time.perf_counter()
     if APPLY_UNITY_FRAME:
         log("[INFO] Applying ENU -> Unity frame transform (Z=North, Y=Up)...")
-        points, rotations, cov6 = apply_frame_transform(points, rotations, cov6, M_ENU_TO_UNITY)
+        points, rotations, cov6 = apply_frame_transform(points, rotations, cov6, M_ENU_TO_UNITY, backend=FRAME_TRANSFORM_BACKEND)
+    stage_times["frame_transform"] = time.perf_counter() - t_stage
 
-    # ---- Recenter ----
+    t_stage = time.perf_counter()
     origin = np.zeros((3,), dtype=np.float32)
     if APPLY_RECENTER:
         origin = compute_recenter_origin(points, RECENTER_MODE)
@@ -770,7 +886,9 @@ def main():
         log("[INFO] Recentering enabled:")
         log(f"  RECENTER_MODE={RECENTER_MODE}")
         log(f"  origin (Unity frame) = [{origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f}]")
+    stage_times["recenter"] = time.perf_counter() - t_stage
 
+    t_stage = time.perf_counter()
     if VERBOSE:
         log("[INFO] Covariance diag stats (m^2): "
             f"xx[{cov6[:,0].min():.3e},{cov6[:,0].max():.3e}] "
@@ -809,8 +927,9 @@ def main():
         opacity=opacity.astype(np.float32),
     )
     log(f"[INFO] Saved Gaussians to: {out_npz}")
+    stage_times["pack_and_save"] = time.perf_counter() - t_stage
 
-    # ---- Optional: write chunks (integrated) ----
+    t_stage = time.perf_counter()
     if WRITE_CHUNKS:
         log("[INFO] Writing chunks...")
         write_chunks_from_arrays(
@@ -822,7 +941,17 @@ def main():
             chunk_size=CHUNK_SIZE.astype(np.float32),
             eps=CHUNK_EPS,
         )
+    stage_times["chunk_writing"] = time.perf_counter() - t_stage
 
+    elapsed = time.perf_counter() - t_start
+
+    log("[INFO] Stage runtime breakdown:")
+    for key in ["load_pcd", "pre_shift", "sampling_and_normals", "knn_and_iso", "adaptive_clamp", "anisotropy", "frame_transform", "recenter", "pack_and_save", "chunk_writing"]:
+        if key in stage_times:
+            v = stage_times[key]
+            log(f"  - {key}: {v:.2f} s ({(100.0 * v / max(elapsed, 1e-9)):.1f}%)")
+
+    log(f"[INFO] Total runtime: {elapsed:.2f} s ({elapsed / 60.0:.2f} min)")
     log("[INFO] Done.")
 
 
@@ -834,11 +963,12 @@ if __name__ == "__main__":
 
     ap.add_argument("--no_batch_aniso", action="store_true", help="Disable SciPy batched anisotropy")
     ap.add_argument("--aniso_block", type=int, default=ANISO_BLOCK_SIZE, help="Batch size for anisotropy")
+    ap.add_argument("--knn_backend", type=str, default=KNN_BACKEND, choices=["auto", "cuda", "cpu"], help="KNN backend for Open3D tensor NNS")
+    ap.add_argument("--knn_query_batch", type=int, default=KNN_QUERY_BATCH, help="Query batch size for tensor KNN")
+    ap.add_argument("--frame_backend", type=str, default=FRAME_TRANSFORM_BACKEND, choices=["auto", "cuda", "cpu"], help="Frame transform backend")
 
-    # NEW: override max points
     ap.add_argument("--max_points", type=int, default=None, help="Override max points for random downsample (-1=all)")
 
-    # NEW: chunk options
     ap.add_argument("--write_chunks", action="store_true", help="Write chunk txt files + chunks_index.json")
     ap.add_argument("--chunk_dir", type=str, default=str(CHUNK_DIR), help="Chunk output directory")
     ap.add_argument("--chunk_prefix", type=str, default=CHUNK_PREFIX, help="Chunk filename prefix")
@@ -853,6 +983,9 @@ if __name__ == "__main__":
     if args.no_batch_aniso:
         USE_BATCH_ANISO = False
     ANISO_BLOCK_SIZE = int(max(1000, args.aniso_block))
+    KNN_BACKEND = str(args.knn_backend).lower().strip()
+    KNN_QUERY_BATCH = int(max(4096, args.knn_query_batch))
+    FRAME_TRANSFORM_BACKEND = str(args.frame_backend).lower().strip()
 
     apply_preset(args.preset)
 
