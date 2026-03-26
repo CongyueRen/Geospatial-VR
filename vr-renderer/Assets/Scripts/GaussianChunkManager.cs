@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using Unity.XR.CoreUtils;
 
 /// <summary>
 /// Reads chunk and LOD information from StreamingAssets/{chunksFolderName}/{lodIndexFileName},
@@ -20,6 +21,47 @@ public class GaussianChunkManager : MonoBehaviour
         GaussianSplat = 0,
         RawPointCloud = 1
     }
+
+    [Serializable]
+    public class DatasetDefinition
+    {
+        public string displayName = "Indoor";
+        public string chunksFolderName = "chunks_Indoordata";
+        public string lodIndexFileName = "chunks_lod_index.json";
+    }
+
+    [Header("Dataset Switching")]
+    public DatasetDefinition indoorDataset = new DatasetDefinition
+    {
+        displayName = "Indoor",
+        chunksFolderName = "chunks_Indoordata",
+        lodIndexFileName = "chunks_lod_index.json"
+    };
+
+    public DatasetDefinition outdoorDataset = new DatasetDefinition
+    {
+        displayName = "Outdoor",
+        chunksFolderName = "chunks_TUMv2",
+        lodIndexFileName = "chunks_lod_index.json"
+    };
+
+    public bool showDatasetSwitcherUI = true;
+    public bool recenterCameraOnDatasetSwitch = true;
+    public float cameraDistancePadding = 4f;
+    public float cameraHeightPadding = 2f;
+
+    [Header("XR Scene Adaption")]
+    [Tooltip("Automatically treat the scene as XR when an XR Origin is present.")]
+    public bool autoDetectXRScene = true;
+
+    [Tooltip("Optional override for the transform that should be moved when recentering in VR.")]
+    public Transform xrRigRootOverride;
+
+    [Tooltip("Hide the legacy OnGUI panel when running in an XR scene.")]
+    public bool hideLegacyOnGUIWhenXRActive = true;
+
+    [Tooltip("Disable the Tab keyboard toggle in XR scenes so desktop input does not interfere with VR interaction.")]
+    public bool disableKeyboardToggleWhenXRActive = true;
 
     [Header("Chunk Folder (in StreamingAssets)")]
     public string chunksFolderName = "chunks_TUMv2";
@@ -161,9 +203,11 @@ public class GaussianChunkManager : MonoBehaviour
     private GUIStyle _panelStyle;
     private GUIStyle _buttonStyle;
     private GUIStyle _labelStyle;
+    private XROrigin _xrOrigin;
 
     private bool UseGaussianSplatMode => currentDisplayMode == DisplayMode.GaussianSplat;
     private bool UseScaleMixtureForCurrentMode => UseGaussianSplatMode && enableScaleMixture;
+    private string CurrentDatasetLabel => GetDatasetLabelForCurrentSelection();
 
     private void Start()
     {
@@ -192,25 +236,36 @@ public class GaussianChunkManager : MonoBehaviour
 
     private void LoadLODIndex()
     {
-        var dir = Path.Combine(Application.streamingAssetsPath, chunksFolderName);
-        var path = Path.Combine(dir, lodIndexFileName);
+        if (!TryLoadLODIndex(chunksFolderName, lodIndexFileName, out _lodIndex))
+            return;
+
+        Debug.Log($"[GaussianChunkManager] Loaded LOD index, chunks={_lodIndex.chunks.Count}");
+    }
+
+    private bool TryLoadLODIndex(string folderName, string indexFileName, out LODIndex lodIndex)
+    {
+        lodIndex = null;
+
+        var dir = Path.Combine(Application.streamingAssetsPath, folderName);
+        var path = Path.Combine(dir, indexFileName);
 
         if (!File.Exists(path))
         {
             Debug.LogError($"[GaussianChunkManager] LOD index file not found: {path}");
-            return;
+            return false;
         }
 
         var json = File.ReadAllText(path);
-        _lodIndex = JsonUtility.FromJson<LODIndex>(json);
+        lodIndex = JsonUtility.FromJson<LODIndex>(json);
 
-        if (_lodIndex == null || _lodIndex.chunks == null)
+        if (lodIndex == null || lodIndex.chunks == null)
         {
-            Debug.LogError("[GaussianChunkManager] Failed to parse LOD index JSON.");
-            return;
+            Debug.LogError($"[GaussianChunkManager] Failed to parse LOD index JSON: {path}");
+            lodIndex = null;
+            return false;
         }
 
-        Debug.Log($"[GaussianChunkManager] Loaded LOD index, chunks={_lodIndex.chunks.Count}");
+        return true;
     }
 
     private Material GetGaussianFineMaterial()
@@ -271,16 +326,7 @@ public class GaussianChunkManager : MonoBehaviour
             return;
         }
 
-        if (_chunkRoot != null)
-            DestroyImmediate(_chunkRoot.gameObject);
-
-        _chunkLoaders.Clear();
-        _chunkLoadersCoarse.Clear();
-        _chunkEntries.Clear();
-        _chunkVisibility.Clear();
-        _isChunkLoaded.Clear();
-        _isFineLoaded.Clear();
-        _isCoarseLoaded.Clear();
+        ClearActiveChunks();
 
         _chunkRoot = new GameObject("GaussianChunksRoot").transform;
         _chunkRoot.SetParent(null, false);
@@ -340,6 +386,42 @@ public class GaussianChunkManager : MonoBehaviour
         }
 
         _lastDisplayMode = currentDisplayMode;
+    }
+
+    private void ClearActiveChunks()
+    {
+        for (int i = 0; i < _chunkLoaders.Count; i++)
+        {
+            if (_chunkLoaders[i] != null)
+            {
+                _chunkLoaders[i].UnloadData();
+                _chunkLoaders[i].enabled = false;
+            }
+
+            if (_chunkLoadersCoarse[i] != null)
+            {
+                _chunkLoadersCoarse[i].UnloadData();
+                _chunkLoadersCoarse[i].enabled = false;
+            }
+        }
+
+        if (_chunkRoot != null)
+        {
+            if (Application.isPlaying)
+                Destroy(_chunkRoot.gameObject);
+            else
+                DestroyImmediate(_chunkRoot.gameObject);
+
+            _chunkRoot = null;
+        }
+
+        _chunkLoaders.Clear();
+        _chunkLoadersCoarse.Clear();
+        _chunkEntries.Clear();
+        _chunkVisibility.Clear();
+        _isChunkLoaded.Clear();
+        _isFineLoaded.Clear();
+        _isCoarseLoaded.Clear();
     }
 
     private void ConfigureLoaderForCurrentMode(GaussianLoader loader, bool isCoarsePass)
@@ -498,8 +580,63 @@ public class GaussianChunkManager : MonoBehaviour
         }
     }
 
+    public void SwitchToIndoorDataset()
+    {
+        SwitchDataset(indoorDataset);
+    }
+
+    public void SwitchToOutdoorDataset()
+    {
+        SwitchDataset(outdoorDataset);
+    }
+
+    public void ReloadCurrentDataset()
+    {
+        var currentDataset = new DatasetDefinition
+        {
+            displayName = CurrentDatasetLabel,
+            chunksFolderName = chunksFolderName,
+            lodIndexFileName = lodIndexFileName
+        };
+
+        SwitchDataset(currentDataset);
+    }
+
+    private void SwitchDataset(DatasetDefinition dataset)
+    {
+        if (dataset == null)
+        {
+            Debug.LogError("[GaussianChunkManager] Dataset definition is null.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(dataset.chunksFolderName) || string.IsNullOrWhiteSpace(dataset.lodIndexFileName))
+        {
+            Debug.LogError("[GaussianChunkManager] Dataset folder or LOD index file is empty.");
+            return;
+        }
+
+        if (!TryLoadLODIndex(dataset.chunksFolderName, dataset.lodIndexFileName, out var nextLodIndex))
+            return;
+
+        chunksFolderName = dataset.chunksFolderName;
+        lodIndexFileName = dataset.lodIndexFileName;
+        _lodIndex = nextLodIndex;
+
+        InitChunks();
+        ApplyParamsToAllLoaders();
+
+        if (recenterCameraOnDatasetSwitch)
+            RecenterMainCameraToDataset(_lodIndex);
+
+        Debug.Log($"[GaussianChunkManager] Switched dataset to {dataset.displayName} ({dataset.chunksFolderName})");
+    }
+
     private void HandleModeToggleInput()
     {
+        if (disableKeyboardToggleWhenXRActive && IsXRSceneActive())
+            return;
+
         if (!allowKeyboardToggle || Keyboard.current == null)
             return;
 
@@ -558,6 +695,145 @@ public class GaussianChunkManager : MonoBehaviour
             return entry.lod.L0.filename;
 
         return entry.filename;
+    }
+
+    private string GetDatasetLabelForCurrentSelection()
+    {
+        if (MatchesDataset(indoorDataset))
+            return indoorDataset.displayName;
+
+        if (MatchesDataset(outdoorDataset))
+            return outdoorDataset.displayName;
+
+        return chunksFolderName;
+    }
+
+    private bool MatchesDataset(DatasetDefinition dataset)
+    {
+        if (dataset == null)
+            return false;
+
+        return string.Equals(chunksFolderName, dataset.chunksFolderName, StringComparison.OrdinalIgnoreCase)
+               && string.Equals(lodIndexFileName, dataset.lodIndexFileName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool TryGetDatasetBounds(LODIndex lodIndex, out Vector3 boundsMin, out Vector3 boundsMax)
+    {
+        boundsMin = Vector3.zero;
+        boundsMax = Vector3.zero;
+
+        if (lodIndex == null || lodIndex.chunks == null || lodIndex.chunks.Count == 0)
+            return false;
+
+        bool initialized = false;
+
+        foreach (var chunk in lodIndex.chunks)
+        {
+            if (chunk == null || chunk.bbox_min == null || chunk.bbox_max == null ||
+                chunk.bbox_min.Length < 3 || chunk.bbox_max.Length < 3)
+            {
+                continue;
+            }
+
+            Vector3 bmin = new Vector3(chunk.bbox_min[0], chunk.bbox_min[1], chunk.bbox_min[2]);
+            Vector3 bmax = new Vector3(chunk.bbox_max[0], chunk.bbox_max[1], chunk.bbox_max[2]);
+
+            if (!initialized)
+            {
+                boundsMin = bmin;
+                boundsMax = bmax;
+                initialized = true;
+                continue;
+            }
+
+            boundsMin = Vector3.Min(boundsMin, bmin);
+            boundsMax = Vector3.Max(boundsMax, bmax);
+        }
+
+        return initialized;
+    }
+
+    private void RecenterMainCameraToDataset(LODIndex lodIndex)
+    {
+        var mainCamera = Camera.main;
+        if (mainCamera == null)
+            return;
+
+        if (!TryGetDatasetBounds(lodIndex, out var boundsMin, out var boundsMax))
+            return;
+
+        Vector3 center = (boundsMin + boundsMax) * 0.5f;
+        Vector3 size = boundsMax - boundsMin;
+
+        float horizontalExtent = Mathf.Max(size.x, size.z) * 0.5f;
+        float cameraDistance = Mathf.Max(5f, horizontalExtent + Mathf.Max(0f, cameraDistancePadding));
+        float cameraHeight = Mathf.Max(2f, size.y * 0.35f + Mathf.Max(0f, cameraHeightPadding));
+
+        Vector3 targetPosition = center + new Vector3(0f, cameraHeight, -cameraDistance);
+        Quaternion targetRotation = Quaternion.LookRotation(center - targetPosition, Vector3.up);
+
+        if (TryGetXRRecenterRoot(mainCamera, out Transform xrRoot))
+        {
+            Vector3 localCameraPosition = xrRoot.InverseTransformPoint(mainCamera.transform.position);
+            Quaternion localCameraRotation = Quaternion.Inverse(xrRoot.rotation) * mainCamera.transform.rotation;
+
+            Quaternion desiredRigRotation = targetRotation * Quaternion.Inverse(localCameraRotation);
+            Vector3 desiredRigPosition = targetPosition - (desiredRigRotation * localCameraPosition);
+
+            xrRoot.SetPositionAndRotation(desiredRigPosition, desiredRigRotation);
+            return;
+        }
+
+        mainCamera.transform.SetPositionAndRotation(targetPosition, targetRotation);
+    }
+
+    private bool IsXRSceneActive()
+    {
+        if (!autoDetectXRScene)
+            return xrRigRootOverride != null;
+
+        if (xrRigRootOverride != null)
+            return true;
+
+        if (_xrOrigin == null)
+            _xrOrigin = FindFirstObjectByType<XROrigin>();
+
+        return _xrOrigin != null;
+    }
+
+    private bool TryGetXRRecenterRoot(Camera mainCamera, out Transform xrRoot)
+    {
+        xrRoot = null;
+
+        if (!IsXRSceneActive())
+            return false;
+
+        if (xrRigRootOverride != null)
+        {
+            xrRoot = xrRigRootOverride;
+            return true;
+        }
+
+        if (_xrOrigin == null)
+            _xrOrigin = FindFirstObjectByType<XROrigin>();
+
+        if (_xrOrigin != null)
+        {
+            xrRoot = _xrOrigin.transform;
+            return true;
+        }
+
+        if (mainCamera != null)
+        {
+            _xrOrigin = mainCamera.GetComponentInParent<XROrigin>();
+            if (_xrOrigin != null)
+            {
+                xrRoot = _xrOrigin.transform;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void Update()
@@ -717,24 +993,56 @@ public class GaussianChunkManager : MonoBehaviour
 
     private void OnGUI()
     {
-        if (!showModeSwitcherUI)
+        if (hideLegacyOnGUIWhenXRActive && IsXRSceneActive())
+            return;
+
+        if (!showModeSwitcherUI && !showDatasetSwitcherUI)
             return;
 
         EnsureGUIStyles();
 
-        Rect panelRect = new Rect(16, 16, 280, 132);
+        float panelHeight = 24f;
+        if (showDatasetSwitcherUI)
+            panelHeight += 128f;
+        if (showModeSwitcherUI)
+            panelHeight += allowKeyboardToggle ? 150f : 124f;
+
+        Rect panelRect = new Rect(16, 16, 320, panelHeight);
         GUILayout.BeginArea(panelRect, _panelStyle);
-        GUILayout.Label("Display Mode", _labelStyle);
-        GUILayout.Label($"Current: {(UseGaussianSplatMode ? "Gaussian Splat" : "Raw Point Cloud")}", _labelStyle);
 
-        if (GUILayout.Button("Gaussian Splat View", _buttonStyle))
-            SetDisplayMode(DisplayMode.GaussianSplat);
+        if (showDatasetSwitcherUI)
+        {
+            GUILayout.Label("Scene Dataset", _labelStyle);
+            GUILayout.Label($"Current: {CurrentDatasetLabel}", _labelStyle);
 
-        if (GUILayout.Button("Raw Point Cloud View", _buttonStyle))
-            SetDisplayMode(DisplayMode.RawPointCloud);
+            bool previousEnabled = GUI.enabled;
 
-        if (allowKeyboardToggle)
-            GUILayout.Label("Press Tab to switch view.", _labelStyle);
+            GUI.enabled = !MatchesDataset(indoorDataset);
+            if (GUILayout.Button(indoorDataset.displayName, _buttonStyle))
+                SwitchToIndoorDataset();
+
+            GUI.enabled = !MatchesDataset(outdoorDataset);
+            if (GUILayout.Button(outdoorDataset.displayName, _buttonStyle))
+                SwitchToOutdoorDataset();
+
+            GUI.enabled = previousEnabled;
+            GUILayout.Space(8f);
+        }
+
+        if (showModeSwitcherUI)
+        {
+            GUILayout.Label("Display Mode", _labelStyle);
+            GUILayout.Label($"Current: {(UseGaussianSplatMode ? "Gaussian Splat" : "Raw Point Cloud")}", _labelStyle);
+
+            if (GUILayout.Button("Gaussian Splat View", _buttonStyle))
+                SetDisplayMode(DisplayMode.GaussianSplat);
+
+            if (GUILayout.Button("Raw Point Cloud View", _buttonStyle))
+                SetDisplayMode(DisplayMode.RawPointCloud);
+
+            if (allowKeyboardToggle)
+                GUILayout.Label("Press Tab to switch view.", _labelStyle);
+        }
 
         GUILayout.EndArea();
     }
