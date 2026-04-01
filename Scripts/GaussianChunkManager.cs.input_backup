@@ -1,0 +1,648 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using UnityEngine;
+
+public class GaussianChunkManager : MonoBehaviour
+{
+    public enum DisplayMode
+    {
+        RawPointCloud = 0,
+        SurfelSplatting = 1,
+    }
+
+    [Header("Chunk Folder (in StreamingAssets)")]
+    public string chunksFolderName = "navvis_chunks_TUMv1";
+
+    [Header("LOD index file name")]
+    public string lodIndexFileName = "navvis_chunks_lod_index.json";
+
+    [Header("Rendering")]
+    public Material pointMaterial;
+    public Material rawPointMaterial;
+
+    [Header("Display Mode")]
+    public DisplayMode currentDisplayMode = DisplayMode.SurfelSplatting;
+    public bool allowKeyboardToggle = true;
+    public bool showModeSwitcherUI = true;
+
+    [Header("Splatting / Rendering Mode")]
+    public bool renderAsSplatQuads = true;
+
+    [Header("Point size (optional / legacy)")]
+    public float rawPointSize = 1.0f;
+    public float pointSizeL0 = 1.0f;
+    public float pointSizeL1 = 1.0f;
+    public float pointSizeL2 = 1.0f;
+
+    [Header("Ellipse Splat Params (per LOD)")]
+    [Range(0f, 1f)] public float opacityL0 = 0.6f;
+    [Range(0f, 1f)] public float opacityL1 = 0.35f;
+    [Range(0f, 1f)] public float opacityL2 = 0.18f;
+    public float sigmaCutoffL0 = 3.0f;
+    public float sigmaCutoffL1 = 3.0f;
+    public float sigmaCutoffL2 = 3.0f;
+    public float minAxisPixels = 0.75f;
+    public float maxAxisPixels = 64.0f;
+
+    [Header("Distance Mixture")]
+    public bool enableScaleMixture = false;
+    public float mixtureStart = 10.0f;
+    public float mixtureEnd = 50.0f;
+    public float coarsePointSizeMultiplier = 1.15f;
+    public float coarseOpacityMultiplier = 0.25f;
+    public float mixtureHysteresis = 1.0f;
+
+    [Header("LOD distances (meters)")]
+    public float lod0To1 = 5f;
+    public float lod1To2 = 15f;
+
+    [Header("LOD hysteresis (meters)")]
+    public float lodHysteresis = 0.75f;
+
+    [Header("Per-frame reload budget")]
+    public int maxReloadsPerFrame = 1;
+
+    [Header("Streaming (chunk load/unload)")]
+    public float loadRadius = 30f;
+    public float unloadRadius = 40f;
+
+    [Header("Debug")]
+    public bool loadOnStart = true;
+    public bool logChunkInfo = true;
+    public bool logLODChanges = true;
+    public bool logCullingChanges = false;
+    public bool logStreamingChanges = true;
+
+    private readonly Plane[] _frustumPlanes = new Plane[6];
+
+    [Serializable]
+    public class LODLevel
+    {
+        public string filename;
+        public int count;
+    }
+
+    [Serializable]
+    public class LODGroup
+    {
+        public LODLevel L0;
+        public LODLevel L1;
+        public LODLevel L2;
+    }
+
+    [Serializable]
+    public class ChunkEntry
+    {
+        public int[] ijk;
+        public string filename;
+        public int count;
+        public float[] bbox_min;
+        public float[] bbox_max;
+        public float[] center;
+        public LODGroup lod;
+    }
+
+    [Serializable]
+    public class LODIndex
+    {
+        public string npz_source;
+        public float[] origin;
+        public float[] chunk_size;
+        public int[] grid_shape;
+        public int num_points;
+        public int num_chunks;
+        public int[] lod_levels;
+        public List<ChunkEntry> chunks;
+    }
+
+    private LODIndex _lodIndex;
+    private Transform _chunkRoot;
+
+    private readonly List<GaussianLoader> _chunkLoaders = new();
+    private readonly List<ChunkEntry> _chunkEntries = new();
+    private readonly List<bool> _chunkVisibility = new();
+    private readonly List<int> _currentLOD = new();
+    private readonly List<int> _pendingLOD = new();
+    private readonly List<bool> _isLoaded = new();
+
+    private DisplayMode _lastDisplayMode;
+    private bool _lastRenderAsSplatQuads;
+    private Material _lastPointMaterial;
+    private Material _lastRawPointMaterial;
+    private float _lastRawPointSize;
+    private float _lastPointSizeL0, _lastPointSizeL1, _lastPointSizeL2;
+    private float _lastOpacityL0, _lastOpacityL1, _lastOpacityL2;
+    private float _lastSigmaL0, _lastSigmaL1, _lastSigmaL2;
+    private float _lastMinAxisPx, _lastMaxAxisPx;
+    private bool _lastEnableScaleMixture;
+    private float _lastMixtureStart, _lastMixtureEnd;
+    private float _lastCoarsePointSizeMultiplier, _lastCoarseOpacityMultiplier;
+
+    private void Start()
+    {
+        if (!loadOnStart)
+            return;
+
+        LoadLODIndex();
+        InitChunks_L0_Only();
+        CacheSplatParams();
+    }
+
+    private static float Smooth01(float value)
+    {
+        value = Mathf.Clamp01(value);
+        return value * value * (3f - 2f * value);
+    }
+
+    private void ToggleDisplayMode()
+    {
+        currentDisplayMode = currentDisplayMode == DisplayMode.RawPointCloud
+            ? DisplayMode.SurfelSplatting
+            : DisplayMode.RawPointCloud;
+    }
+
+    private void ApplySplatParamsToLoader(GaussianLoader loader, int lodLevel, float distanceToCamera = 0f)
+    {
+        if (loader == null)
+            return;
+
+        bool useSplatMode = currentDisplayMode == DisplayMode.SurfelSplatting;
+        Material targetMaterial = useSplatMode
+            ? (pointMaterial != null ? pointMaterial : rawPointMaterial)
+            : (rawPointMaterial != null ? rawPointMaterial : pointMaterial);
+
+        if (targetMaterial != null)
+            loader.SetPointMaterial(targetMaterial);
+
+        loader.renderAsSplatQuads = useSplatMode && renderAsSplatQuads;
+
+        float pointSize;
+        float opacity;
+        float sigmaCutoff;
+
+        if (!useSplatMode)
+        {
+            pointSize = rawPointSize;
+            opacity = 1.0f;
+            sigmaCutoff = sigmaCutoffL0;
+        }
+        else
+        {
+            switch (lodLevel)
+            {
+                case 0:
+                    pointSize = pointSizeL0;
+                    opacity = opacityL0;
+                    sigmaCutoff = sigmaCutoffL0;
+                    break;
+                case 1:
+                    pointSize = pointSizeL1;
+                    opacity = opacityL1;
+                    sigmaCutoff = sigmaCutoffL1;
+                    break;
+                default:
+                    pointSize = pointSizeL2;
+                    opacity = opacityL2;
+                    sigmaCutoff = sigmaCutoffL2;
+                    break;
+            }
+
+            if (enableScaleMixture && mixtureEnd > mixtureStart)
+            {
+                float start = Mathf.Max(0f, mixtureStart - mixtureHysteresis);
+                float end = Mathf.Max(start + 0.01f, mixtureEnd + mixtureHysteresis);
+                float t = Smooth01(Mathf.InverseLerp(start, end, distanceToCamera));
+                pointSize *= Mathf.Lerp(1f, coarsePointSizeMultiplier, t);
+                opacity *= Mathf.Lerp(1f, coarseOpacityMultiplier, t);
+            }
+        }
+
+        loader.pointSize = pointSize;
+        loader.opacity = opacity;
+        loader.sigmaCutoff = sigmaCutoff;
+        loader.minAxisPixels = minAxisPixels;
+        loader.maxAxisPixels = maxAxisPixels;
+    }
+
+    private bool SplatParamsChanged()
+    {
+        if (_lastDisplayMode != currentDisplayMode) return true;
+        if (_lastRenderAsSplatQuads != renderAsSplatQuads) return true;
+        if (_lastPointMaterial != pointMaterial) return true;
+        if (_lastRawPointMaterial != rawPointMaterial) return true;
+        if (!Mathf.Approximately(_lastRawPointSize, rawPointSize)) return true;
+
+        if (!Mathf.Approximately(_lastPointSizeL0, pointSizeL0) ||
+            !Mathf.Approximately(_lastPointSizeL1, pointSizeL1) ||
+            !Mathf.Approximately(_lastPointSizeL2, pointSizeL2)) return true;
+
+        if (!Mathf.Approximately(_lastOpacityL0, opacityL0) ||
+            !Mathf.Approximately(_lastOpacityL1, opacityL1) ||
+            !Mathf.Approximately(_lastOpacityL2, opacityL2)) return true;
+
+        if (!Mathf.Approximately(_lastSigmaL0, sigmaCutoffL0) ||
+            !Mathf.Approximately(_lastSigmaL1, sigmaCutoffL1) ||
+            !Mathf.Approximately(_lastSigmaL2, sigmaCutoffL2)) return true;
+
+        if (!Mathf.Approximately(_lastMinAxisPx, minAxisPixels) ||
+            !Mathf.Approximately(_lastMaxAxisPx, maxAxisPixels)) return true;
+
+        if (_lastEnableScaleMixture != enableScaleMixture) return true;
+        if (!Mathf.Approximately(_lastMixtureStart, mixtureStart) ||
+            !Mathf.Approximately(_lastMixtureEnd, mixtureEnd) ||
+            !Mathf.Approximately(_lastCoarsePointSizeMultiplier, coarsePointSizeMultiplier) ||
+            !Mathf.Approximately(_lastCoarseOpacityMultiplier, coarseOpacityMultiplier)) return true;
+
+        return false;
+    }
+
+    private void CacheSplatParams()
+    {
+        _lastDisplayMode = currentDisplayMode;
+        _lastRenderAsSplatQuads = renderAsSplatQuads;
+        _lastPointMaterial = pointMaterial;
+        _lastRawPointMaterial = rawPointMaterial;
+        _lastRawPointSize = rawPointSize;
+
+        _lastPointSizeL0 = pointSizeL0;
+        _lastPointSizeL1 = pointSizeL1;
+        _lastPointSizeL2 = pointSizeL2;
+
+        _lastOpacityL0 = opacityL0;
+        _lastOpacityL1 = opacityL1;
+        _lastOpacityL2 = opacityL2;
+
+        _lastSigmaL0 = sigmaCutoffL0;
+        _lastSigmaL1 = sigmaCutoffL1;
+        _lastSigmaL2 = sigmaCutoffL2;
+
+        _lastMinAxisPx = minAxisPixels;
+        _lastMaxAxisPx = maxAxisPixels;
+
+        _lastEnableScaleMixture = enableScaleMixture;
+        _lastMixtureStart = mixtureStart;
+        _lastMixtureEnd = mixtureEnd;
+        _lastCoarsePointSizeMultiplier = coarsePointSizeMultiplier;
+        _lastCoarseOpacityMultiplier = coarseOpacityMultiplier;
+    }
+
+    private void ApplySplatParamsToAllLoaders()
+    {
+        if (_chunkLoaders.Count == 0)
+            return;
+
+        for (int i = 0; i < _chunkLoaders.Count; i++)
+        {
+            var loader = _chunkLoaders[i];
+            int lod = i < _currentLOD.Count ? _currentLOD[i] : 0;
+            ApplySplatParamsToLoader(loader, lod);
+        }
+
+        CacheSplatParams();
+    }
+
+    private bool IsChunkVisible(Plane[] planes, Vector3 bmin, Vector3 bmax)
+    {
+        foreach (var p in planes)
+        {
+            Vector3 v = new Vector3(
+                p.normal.x >= 0 ? bmax.x : bmin.x,
+                p.normal.y >= 0 ? bmax.y : bmin.y,
+                p.normal.z >= 0 ? bmax.z : bmin.z);
+
+            if (Vector3.Dot(p.normal, v) + p.distance < 0)
+                return false;
+        }
+
+        return true;
+    }
+
+    private void LoadLODIndex()
+    {
+        var dir = Path.Combine(Application.streamingAssetsPath, chunksFolderName);
+        var path = Path.Combine(dir, lodIndexFileName);
+
+        if (!File.Exists(path))
+        {
+            Debug.LogError($"[GaussianChunkManager] LOD index file not found: {path}");
+            return;
+        }
+
+        var json = File.ReadAllText(path);
+        _lodIndex = JsonUtility.FromJson<LODIndex>(json);
+
+        if (_lodIndex == null || _lodIndex.chunks == null)
+        {
+            Debug.LogError("[GaussianChunkManager] Failed to parse LOD index JSON.");
+            return;
+        }
+
+        Debug.Log($"[GaussianChunkManager] Loaded LOD index, chunks={_lodIndex.chunks.Count}");
+    }
+
+    public void InitChunks_L0_Only()
+    {
+        if (_lodIndex == null || _lodIndex.chunks == null)
+        {
+            Debug.LogError("[GaussianChunkManager] LOD index not loaded.");
+            return;
+        }
+
+        if (pointMaterial == null && rawPointMaterial == null)
+        {
+            Debug.LogError("[GaussianChunkManager] No display materials are assigned.");
+            return;
+        }
+
+        if (_chunkRoot != null)
+            DestroyImmediate(_chunkRoot.gameObject);
+
+        _chunkLoaders.Clear();
+        _chunkEntries.Clear();
+        _chunkVisibility.Clear();
+        _currentLOD.Clear();
+        _pendingLOD.Clear();
+        _isLoaded.Clear();
+
+        _chunkRoot = new GameObject("GaussianChunksRoot_Block1").transform;
+        _chunkRoot.SetParent(null, false);
+        _chunkRoot.position = Vector3.zero;
+        _chunkRoot.rotation = Quaternion.identity;
+        _chunkRoot.localScale = Vector3.one;
+
+        int created = 0;
+        string chunkDir = Path.Combine(Application.streamingAssetsPath, chunksFolderName);
+
+        foreach (var entry in _lodIndex.chunks)
+        {
+            if (entry == null || entry.count <= 0)
+                continue;
+
+            string l0FileName = null;
+            if (entry.lod != null && entry.lod.L0 != null && !string.IsNullOrEmpty(entry.lod.L0.filename))
+                l0FileName = entry.lod.L0.filename;
+            else if (!string.IsNullOrEmpty(entry.filename))
+                l0FileName = entry.filename;
+
+            if (string.IsNullOrEmpty(l0FileName))
+                continue;
+
+            string fullPath = Path.Combine(chunkDir, l0FileName);
+            if (!File.Exists(fullPath))
+            {
+                Debug.LogWarning($"[GaussianChunkManager] L0 file not found for chunk: {fullPath}");
+                continue;
+            }
+
+            string chunkName = $"Chunk_{entry.ijk[0]}_{entry.ijk[1]}_{entry.ijk[2]}";
+            GameObject go = new GameObject(chunkName);
+            go.transform.SetParent(_chunkRoot, false);
+
+            var loader = go.AddComponent<GaussianLoader>();
+            loader.dataFileName = Path.Combine(chunksFolderName, l0FileName);
+            loader.pointMaterial = pointMaterial != null ? pointMaterial : rawPointMaterial;
+            loader.treatInputAsWorldSpace = true;
+            ApplySplatParamsToLoader(loader, 0);
+
+            _chunkLoaders.Add(loader);
+            _chunkEntries.Add(entry);
+            _chunkVisibility.Add(true);
+            _currentLOD.Add(0);
+            _pendingLOD.Add(-1);
+            _isLoaded.Add(true);
+            created++;
+
+            if (logChunkInfo)
+                Debug.Log($"[GaussianChunkManager] Created {chunkName} (L0={l0FileName}, count={entry.count})");
+        }
+
+        ApplySplatParamsToAllLoaders();
+        Debug.Log($"[GaussianChunkManager] Created {created} Gaussian chunk loaders.");
+    }
+
+    private string GetLODFileName(ChunkEntry entry, int lodLevel)
+    {
+        if (entry.lod != null)
+        {
+            if (lodLevel == 0 && entry.lod.L0 != null && !string.IsNullOrEmpty(entry.lod.L0.filename))
+                return entry.lod.L0.filename;
+            if (lodLevel == 1 && entry.lod.L1 != null && !string.IsNullOrEmpty(entry.lod.L1.filename))
+                return entry.lod.L1.filename;
+            if (lodLevel == 2 && entry.lod.L2 != null && !string.IsNullOrEmpty(entry.lod.L2.filename))
+                return entry.lod.L2.filename;
+        }
+
+        if (entry.lod != null && entry.lod.L0 != null && !string.IsNullOrEmpty(entry.lod.L0.filename))
+            return entry.lod.L0.filename;
+
+        return entry.filename;
+    }
+
+    private static float DistancePointToAABB(Vector3 p, Vector3 bmin, Vector3 bmax)
+    {
+        float dx = 0f;
+        if (p.x < bmin.x) dx = bmin.x - p.x;
+        else if (p.x > bmax.x) dx = p.x - bmax.x;
+
+        float dy = 0f;
+        if (p.y < bmin.y) dy = bmin.y - p.y;
+        else if (p.y > bmax.y) dy = p.y - bmax.y;
+
+        float dz = 0f;
+        if (p.z < bmin.z) dz = bmin.z - p.z;
+        else if (p.z > bmax.z) dz = p.z - bmax.z;
+
+        return Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private int ChooseLODWithHysteresis(float distForLOD, int currentLod)
+    {
+        float h = Mathf.Max(0f, lodHysteresis);
+
+        if (currentLod == 0)
+        {
+            if (distForLOD > lod0To1 + h) return 1;
+            return 0;
+        }
+
+        if (currentLod == 2)
+        {
+            if (distForLOD < lod1To2 - h) return 1;
+            return 2;
+        }
+
+        if (distForLOD < lod0To1 - h) return 0;
+        if (distForLOD > lod1To2 + h) return 2;
+        return 1;
+    }
+
+    private void Update()
+    {
+        if (allowKeyboardToggle && Input.GetKeyDown(KeyCode.Tab))
+            ToggleDisplayMode();
+
+        if (SplatParamsChanged())
+            ApplySplatParamsToAllLoaders();
+
+        if (Camera.main == null || _lodIndex == null)
+            return;
+
+        int reloadsThisFrame = 0;
+        GeometryUtility.CalculateFrustumPlanes(Camera.main, _frustumPlanes);
+        Vector3 camPos = Camera.main.transform.position;
+
+        for (int i = 0; i < _chunkLoaders.Count; i++)
+        {
+            var loader = _chunkLoaders[i];
+            var entry = _chunkEntries[i];
+            if (loader == null || entry == null || entry.bbox_min == null || entry.bbox_max == null)
+                continue;
+
+            Vector3 bmin = new Vector3(entry.bbox_min[0], entry.bbox_min[1], entry.bbox_min[2]);
+            Vector3 bmax = new Vector3(entry.bbox_max[0], entry.bbox_max[1], entry.bbox_max[2]);
+
+            bool visible = IsChunkVisible(_frustumPlanes, bmin, bmax);
+            loader.enabled = visible && _isLoaded[i];
+
+            if (logCullingChanges && _chunkVisibility[i] != visible)
+            {
+                _chunkVisibility[i] = visible;
+                Debug.Log($"[ChunkCulling] {loader.gameObject.name} visible = {visible}");
+            }
+
+            Vector3 center = entry.center != null && entry.center.Length >= 3
+                ? new Vector3(entry.center[0], entry.center[1], entry.center[2])
+                : (bmin + bmax) * 0.5f;
+
+            float distCenter = Vector3.Distance(camPos, center);
+            float distAabb = DistancePointToAABB(camPos, bmin, bmax);
+
+            if (unloadRadius < loadRadius)
+                unloadRadius = loadRadius + 1f;
+
+            bool shouldLoad = distAabb < loadRadius;
+            bool shouldUnload = distAabb > unloadRadius;
+
+            if (_isLoaded[i] && shouldUnload)
+            {
+                loader.UnloadData();
+                _isLoaded[i] = false;
+                if (i < _pendingLOD.Count) _pendingLOD[i] = -1;
+                loader.enabled = false;
+
+                if (logStreamingChanges)
+                    Debug.Log($"[Streaming] Unload {loader.gameObject.name} (aabb={distAabb:F1}m, center={distCenter:F1}m)");
+
+                continue;
+            }
+
+            int current = i < _currentLOD.Count ? _currentLOD[i] : 0;
+            int desiredLOD = ChooseLODWithHysteresis(distCenter, current);
+
+            if (!_isLoaded[i] && shouldLoad)
+            {
+                int targetLOD = i < _pendingLOD.Count && _pendingLOD[i] >= 0 ? _pendingLOD[i] : desiredLOD;
+
+                if (reloadsThisFrame >= Mathf.Max(0, maxReloadsPerFrame))
+                {
+                    if (i < _pendingLOD.Count) _pendingLOD[i] = targetLOD;
+                    continue;
+                }
+
+                string lodFileToLoad = GetLODFileName(entry, targetLOD);
+                if (!string.IsNullOrEmpty(lodFileToLoad))
+                {
+                    loader.dataFileName = Path.Combine(chunksFolderName, lodFileToLoad);
+                    ApplySplatParamsToLoader(loader, targetLOD, distCenter);
+                    loader.ReloadData();
+                    reloadsThisFrame++;
+                    _isLoaded[i] = true;
+                    _currentLOD[i] = targetLOD;
+                    if (i < _pendingLOD.Count) _pendingLOD[i] = -1;
+
+                    if (logStreamingChanges)
+                        Debug.Log($"[Streaming] Load {loader.gameObject.name} (LOD{targetLOD}, aabb={distAabb:F1}m, center={distCenter:F1}m)");
+                }
+
+                continue;
+            }
+
+            if (_isLoaded[i])
+            {
+                int prevLOD = _currentLOD[i];
+                int pending = i < _pendingLOD.Count ? _pendingLOD[i] : -1;
+                if (pending >= 0 && pending != prevLOD)
+                {
+                    if (reloadsThisFrame < Mathf.Max(0, maxReloadsPerFrame))
+                    {
+                        string pendFile = GetLODFileName(entry, pending);
+                        if (!string.IsNullOrEmpty(pendFile))
+                        {
+                            loader.dataFileName = Path.Combine(chunksFolderName, pendFile);
+                            ApplySplatParamsToLoader(loader, pending, distCenter);
+                            loader.ReloadData();
+                            reloadsThisFrame++;
+                            _currentLOD[i] = pending;
+                            _pendingLOD[i] = -1;
+
+                            if (logLODChanges)
+                                Debug.Log($"[LOD] {loader.gameObject.name} -> LOD{pending} (file={pendFile}, pending, center={distCenter:F1}m)");
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (desiredLOD != prevLOD)
+                {
+                    if (reloadsThisFrame >= Mathf.Max(0, maxReloadsPerFrame))
+                    {
+                        if (i < _pendingLOD.Count) _pendingLOD[i] = desiredLOD;
+                        continue;
+                    }
+
+                    string lodFile = GetLODFileName(entry, desiredLOD);
+                    if (!string.IsNullOrEmpty(lodFile))
+                    {
+                        loader.dataFileName = Path.Combine(chunksFolderName, lodFile);
+                        ApplySplatParamsToLoader(loader, desiredLOD, distCenter);
+                        loader.ReloadData();
+                        reloadsThisFrame++;
+                        _currentLOD[i] = desiredLOD;
+                        if (i < _pendingLOD.Count) _pendingLOD[i] = -1;
+
+                        if (logLODChanges)
+                            Debug.Log($"[LOD] {loader.gameObject.name} -> LOD{desiredLOD} (file={lodFile}, center={distCenter:F1}m)");
+                    }
+                }
+                else
+                {
+                    ApplySplatParamsToLoader(loader, desiredLOD, distCenter);
+                }
+            }
+        }
+    }
+
+    private void OnGUI()
+    {
+        if (!showModeSwitcherUI)
+            return;
+
+        const float width = 180f;
+        const float height = 34f;
+        const float x = 16f;
+        const float y = 16f;
+
+        GUI.Box(new Rect(x - 8f, y - 8f, width + 16f, 92f), "Display Mode");
+
+        bool raw = currentDisplayMode == DisplayMode.RawPointCloud;
+        bool splat = currentDisplayMode == DisplayMode.SurfelSplatting;
+
+        if (GUI.Toggle(new Rect(x, y + 18f, width, height), raw, "Raw Point Cloud") && !raw)
+            currentDisplayMode = DisplayMode.RawPointCloud;
+
+        if (GUI.Toggle(new Rect(x, y + 52f, width, height), splat, "Surfel Splatting") && !splat)
+            currentDisplayMode = DisplayMode.SurfelSplatting;
+    }
+}
