@@ -447,23 +447,37 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: e6b7c26929bad42f1926cde4a17b6135, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GaussianChunkManager
+  activeDatasetMode: 1
+  activeSamplingMode: 0
   indoorDataset:
     displayName: Indoor
-    chunksFolderName: chunks_Indoordata
+    chunksFolderName: chunks_indoor_random
+    randomChunksFolderName: chunks_indoor_random
+    uniformChunksFolderName: chunks_indoor_uniform
     lodIndexFileName: chunks_lod_index.json
   outdoorDataset:
     displayName: Outdoor
-    chunksFolderName: chunks_TUMv2
+    chunksFolderName: chunks_outdoor_random
+    randomChunksFolderName: chunks_outdoor_random
+    uniformChunksFolderName: chunks_outdoor_uniform
     lodIndexFileName: chunks_lod_index.json
   showDatasetSwitcherUI: 1
+  showSamplingSwitcherUI: 1
   recenterCameraOnDatasetSwitch: 1
-  cameraDistancePadding: 4
-  cameraHeightPadding: 2
+  cameraDistancePadding: 0
+  cameraHeightPadding: 0
   autoDetectXRScene: 1
   xrRigRootOverride: {fileID: 0}
   hideLegacyOnGUIWhenXRActive: 1
   disableKeyboardToggleWhenXRActive: 1
-  chunksFolderName: chunks_Indoordata
+  useDatasetFloorHeightForXRRecenter: 1
+  xrStandingEyeHeight: 1.65
+  xrAdditionalHeightOffset: 0
+  xrPlaceUserNearDatasetCenter: 1
+  xrPlanarOffsetFromCenter: {x: 0, y: 0}
+  xrKeepLevelViewOnRecenter: 1
+  chunksFolderName: chunks_outdoor_random
+  allowProjectDataFolderFallback: 1
   lodIndexFileName: chunks_lod_index.json
   pointMaterial: {fileID: 2100000, guid: 703843be868f7482aa911ff5d9f3fc57, type: 2}
   rawPointMaterial: {fileID: 2100000, guid: 44a6b8645b11f5340a5f0f6d8e73df34, type: 2}
@@ -474,25 +488,35 @@ MonoBehaviour:
   rawPointSize: 1
   pointSizeL0: 1
   pointSizeL1: 1
-  opacityL0: 0.699
-  opacityL1: 0.573
-  sigmaCutoffL0: 3
-  sigmaCutoffL1: 3
+  pointSizeL2: 1
+  pointSizeL3: 1
+  pointSizeL4: 1
+  opacityL0: 0.65
+  opacityL1: 0.55
+  opacityL2: 0.4
+  opacityL3: 0.32
+  opacityL4: 0.28
+  sigmaCutoffL0: 2.5
+  sigmaCutoffL1: 2.5
+  sigmaCutoffL2: 2.75
+  sigmaCutoffL3: 3
+  sigmaCutoffL4: 3
   minAxisPixels: 0.75
-  maxAxisPixels: 10
-  enableScaleMixture: 1
-  mixtureStart: 10
-  mixtureEnd: 50
-  coarsePointSizeMultiplier: 1.15
-  coarseOpacityMultiplier: 0.25
-  mixtureHysteresis: 1
+  maxAxisPixels: 16
+  activeLodLevel: 2
+  showLodSwitcherUI: 1
+  allowKeyboardLodSwitch: 1
+  fallbackToNearestAvailableLod: 1
+  logLODChanges: 1
   maxReloadsPerFrame: 1
   loadRadius: 999
   unloadRadius: 1000
   loadOnStart: 1
-  logChunkInfo: 1
-  logStreamingChanges: 1
-  logCullingChanges: 1
+  waitForFirstRenderedFrameBeforeInitialLoad: 1
+  initialLoadDelaySeconds: 1
+  logChunkInfo: 0
+  logStreamingChanges: 0
+  logCullingChanges: 0
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
@@ -578,10 +602,10 @@ MonoBehaviour:
   overrideBasicShaderParams: 1
   overrideOITShaderParams: 0
   renderAsSplatQuads: 1
-  opacity: 0.7
-  sigmaCutoff: 3
+  opacity: 0.65
+  sigmaCutoff: 2.5
   minAxisPixels: 0.75
-  maxAxisPixels: 64
+  maxAxisPixels: 16
   pointSize: 1
   opacityMultiplier: 1
   pointSizeMultiplier: 1
