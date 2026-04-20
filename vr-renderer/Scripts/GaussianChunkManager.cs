@@ -17,36 +17,65 @@ using Unity.XR.CoreUtils;
 /// </summary>
 public class GaussianChunkManager : MonoBehaviour
 {
+    public const string DefaultIndoorChunksFolderName = "chunks_indoor_random";
+    public const string DefaultIndoorUniformChunksFolderName = "chunks_indoor_uniform";
+    public const string LatestOutdoorChunksFolderName = "chunks_outdoor_random";
+    public const string DefaultUniformChunksFolderName = "chunks_outdoor_uniform";
+    public const string DefaultLodIndexFileName = "chunks_lod_index.json";
+
     public enum DisplayMode
     {
         GaussianSplat = 0,
         RawPointCloud = 1
     }
 
+    public enum DatasetMode
+    {
+        Indoor = 0,
+        Outdoor = 1
+    }
+
+    public enum SamplingMode
+    {
+        Random = 0,
+        Uniform = 1
+    }
+
     [Serializable]
     public class DatasetDefinition
     {
         public string displayName = "Indoor";
-        public string chunksFolderName = "chunks_Indoordata";
-        public string lodIndexFileName = "chunks_lod_index.json";
+        [HideInInspector]
+        public string chunksFolderName = DefaultIndoorChunksFolderName;
+        public string randomChunksFolderName = DefaultIndoorChunksFolderName;
+        public string uniformChunksFolderName = DefaultIndoorUniformChunksFolderName;
+        public string lodIndexFileName = DefaultLodIndexFileName;
     }
 
     [Header("Dataset Switching")]
+    public DatasetMode activeDatasetMode = DatasetMode.Outdoor;
+    public SamplingMode activeSamplingMode = SamplingMode.Random;
+
     public DatasetDefinition indoorDataset = new DatasetDefinition
     {
         displayName = "Indoor",
-        chunksFolderName = "chunks_Indoordata",
-        lodIndexFileName = "chunks_lod_index.json"
+        chunksFolderName = DefaultIndoorChunksFolderName,
+        randomChunksFolderName = DefaultIndoorChunksFolderName,
+        uniformChunksFolderName = DefaultIndoorUniformChunksFolderName,
+        lodIndexFileName = DefaultLodIndexFileName
     };
 
     public DatasetDefinition outdoorDataset = new DatasetDefinition
     {
         displayName = "Outdoor",
-        chunksFolderName = "chunks_TUMv2",
-        lodIndexFileName = "chunks_lod_index.json"
+        chunksFolderName = LatestOutdoorChunksFolderName,
+        randomChunksFolderName = LatestOutdoorChunksFolderName,
+        uniformChunksFolderName = DefaultUniformChunksFolderName,
+        lodIndexFileName = DefaultLodIndexFileName
     };
 
     public bool showDatasetSwitcherUI = true;
+    public bool showSamplingSwitcherUI = true;
     public bool recenterCameraOnDatasetSwitch = true;
     public float cameraDistancePadding = 4f;
     public float cameraHeightPadding = 2f;
@@ -74,14 +103,23 @@ public class GaussianChunkManager : MonoBehaviour
     [Tooltip("Extra vertical offset added on top of the standing eye height in XR scenes.")]
     public float xrAdditionalHeightOffset = 0.0f;
 
+    [Tooltip("When enabled, place the XR user near the dataset center on the horizontal plane instead of outside the dataset looking in.")]
+    public bool xrPlaceUserNearDatasetCenter = true;
+
+    [Tooltip("Extra horizontal X/Z offset from the dataset center for XR placement.")]
+    public Vector2 xrPlanarOffsetFromCenter = Vector2.zero;
+
     [Tooltip("Keep the XR view mostly level when recentering instead of forcing a downward look toward dataset center.")]
     public bool xrKeepLevelViewOnRecenter = true;
 
     [Header("Chunk Folder (in StreamingAssets)")]
-    public string chunksFolderName = "chunks_TUMv2";
+    public string chunksFolderName = LatestOutdoorChunksFolderName;
+
+    [Tooltip("In the Unity Editor, also try <repo>/data/<chunksFolderName> when the folder is not under StreamingAssets.")]
+    public bool allowProjectDataFolderFallback = true;
 
     [Header("LOD index file name")]
-    public string lodIndexFileName = "chunks_lod_index.json";
+    public string lodIndexFileName = DefaultLodIndexFileName;
 
     [Header("Rendering")]
     [Tooltip("Base material for the Gaussian splat view.")]
@@ -99,19 +137,28 @@ public class GaussianChunkManager : MonoBehaviour
     public bool renderAsSplatQuads = true;
 
     [Header("Raw Point Cloud")]
-    public float rawPointSize = 2.0f;
+    public float rawPointSize = 1.0f;
 
     [Header("Point size (optional / legacy)")]
     public float pointSizeL0 = 1.0f;
     public float pointSizeL1 = 1.0f;
+    public float pointSizeL2 = 1.0f;
+    public float pointSizeL3 = 1.0f;
+    public float pointSizeL4 = 1.0f;
 
-    [Header("Ellipse Splat Params (two-level)")]
+    [Header("Ellipse Splat Params (per LOD)")]
     [Range(0f, 1f)] public float opacityL0 = 0.6f;
     [Range(0f, 1f)] public float opacityL1 = 0.18f;
+    [Range(0f, 1f)] public float opacityL2 = 0.24f;
+    [Range(0f, 1f)] public float opacityL3 = 0.28f;
+    [Range(0f, 1f)] public float opacityL4 = 0.32f;
 
     [Tooltip("k-sigma cutoff used to size ellipse quads (typical 2~4).")]
     public float sigmaCutoffL0 = 3.0f;
     public float sigmaCutoffL1 = 3.0f;
+    public float sigmaCutoffL2 = 3.0f;
+    public float sigmaCutoffL3 = 3.0f;
+    public float sigmaCutoffL4 = 3.0f;
 
     [Tooltip("Clamp ellipse axis in pixel units (min).")]
     public float minAxisPixels = 0.75f;
@@ -119,25 +166,17 @@ public class GaussianChunkManager : MonoBehaviour
     [Tooltip("Clamp ellipse axis in pixel units (max).")]
     public float maxAxisPixels = 64.0f;
 
-    [Header("Scale Mixture (dual-pass, L0 + L1)")]
-    [Tooltip("Render each chunk twice: Fine(L0) for detail, Coarse(L1) for gap filling. Blended by distance.")]
-    public bool enableScaleMixture = true;
+    [Header("LOD Layer Switching")]
+    [Tooltip("Currently displayed LOD layer. Keyboard shortcuts 1-5 map to L0-L4 when enabled.")]
+    [Range(0, 4)] public int activeLodLevel = 0;
 
-    [Tooltip("Distance where coarse pass starts to fade in (meters).")]
-    public float mixtureStart = 8f;
+    public bool showLodSwitcherUI = true;
+    public bool allowKeyboardLodSwitch = true;
 
-    [Tooltip("Distance where coarse pass reaches full strength (meters).")]
-    public float mixtureEnd = 25f;
+    [Tooltip("If enabled, unavailable chunk LOD files fall back to the closest available LOD file for that chunk.")]
+    public bool fallbackToNearestAvailableLod = true;
 
-    [Tooltip("Extra pointSize multiplier for the coarse pass (fills scanline gaps).")]
-    public float coarsePointSizeMultiplier = 2.5f;
-
-    [Tooltip("Opacity multiplier for the coarse pass relative to L1 opacity (avoid over-bright).")]
-    public float coarseOpacityMultiplier = 0.35f;
-
-    [Header("Mixture hysteresis (meters)")]
-    [Tooltip("Avoid loading/unloading fine/coarse near mixture thresholds.")]
-    public float mixtureHysteresis = 1.0f;
+    public bool logLODChanges = true;
 
     [Header("Per-frame reload budget")]
     [Tooltip("Limits how many loaders may call ReloadData() per frame to avoid VR hitching.")]
@@ -165,7 +204,26 @@ public class GaussianChunkManager : MonoBehaviour
     private readonly Plane[] _frustumPlanes = new Plane[6];
 
     [Serializable] public class LODLevel { public string filename; public int count; }
-    [Serializable] public class LODGroup { public LODLevel L0; public LODLevel L1; public LODLevel L2; }
+    [Serializable] public class LODGroup { public LODLevel L0; public LODLevel L1; public LODLevel L2; public LODLevel L3; public LODLevel L4; }
+
+    [Serializable]
+    public class GaussianLODManifestLevel
+    {
+        public int level;
+        public string label;
+        public string sampling_method;
+        public string sampling_parameter_name;
+        public float sampling_parameter_value;
+        public string sampling_parameter_label;
+        public int num_points;
+    }
+
+    [Serializable]
+    public class GaussianLODManifest
+    {
+        public string sampling_method;
+        public List<GaussianLODManifestLevel> levels;
+    }
 
     [Serializable]
     public class ChunkEntry
@@ -177,6 +235,8 @@ public class GaussianChunkManager : MonoBehaviour
         public float[] bbox_max;
         public float[] center;
         public LODGroup lod;
+        public string[] lod_files;
+        public int[] lod_counts;
     }
 
     [Serializable]
@@ -189,6 +249,7 @@ public class GaussianChunkManager : MonoBehaviour
         public int num_points;
         public int num_chunks;
         public int[] lod_levels;
+        public GaussianLODManifest gaussian_lod_manifest;
         public List<ChunkEntry> chunks;
     }
 
@@ -196,29 +257,37 @@ public class GaussianChunkManager : MonoBehaviour
     private Transform _chunkRoot;
 
     private Material _pointMaterialFineInstance;
-    private Material _pointMaterialCoarseInstance;
     private Material _rawPointMaterialInstance;
 
     private readonly List<GaussianLoader> _chunkLoaders = new();
-    private readonly List<GaussianLoader> _chunkLoadersCoarse = new();
     private readonly List<ChunkEntry> _chunkEntries = new();
     private readonly List<bool> _chunkVisibility = new();
     private readonly List<bool> _isChunkLoaded = new();
     private readonly List<bool> _isFineLoaded = new();
-    private readonly List<bool> _isCoarseLoaded = new();
+    private readonly List<int> _fineLodLevels = new();
 
     private DisplayMode _lastDisplayMode;
     private bool _lastRenderAsSplatQuads;
     private float _lastPointSizeL0;
     private float _lastPointSizeL1;
+    private float _lastPointSizeL2;
+    private float _lastPointSizeL3;
+    private float _lastPointSizeL4;
     private float _lastOpacityL0;
     private float _lastOpacityL1;
+    private float _lastOpacityL2;
+    private float _lastOpacityL3;
+    private float _lastOpacityL4;
     private float _lastSigmaL0;
     private float _lastSigmaL1;
+    private float _lastSigmaL2;
+    private float _lastSigmaL3;
+    private float _lastSigmaL4;
     private float _lastMinAxisPx;
     private float _lastMaxAxisPx;
     private float _lastRawPointSize;
-    private bool _lastScaleMixture;
+    private int _lastActiveLodLevel;
+    private string _resolvedChunkDir;
 
     private GUIStyle _panelStyle;
     private GUIStyle _buttonStyle;
@@ -226,11 +295,33 @@ public class GaussianChunkManager : MonoBehaviour
     private XROrigin _xrOrigin;
 
     private bool UseGaussianSplatMode => currentDisplayMode == DisplayMode.GaussianSplat;
-    private bool UseScaleMixtureForCurrentMode => UseGaussianSplatMode && enableScaleMixture;
     private string CurrentDatasetLabel => GetDatasetLabelForCurrentSelection();
+
+    private void Awake()
+    {
+        NormalizeDatasetSettings();
+    }
+
+    private void Reset()
+    {
+        NormalizeDatasetSettings();
+        chunksFolderName = LatestOutdoorChunksFolderName;
+        lodIndexFileName = DefaultLodIndexFileName;
+        activeDatasetMode = DatasetMode.Outdoor;
+        activeSamplingMode = SamplingMode.Random;
+    }
+
+#if UNITY_EDITOR
+    private void OnValidate()
+    {
+        NormalizeDatasetSettings();
+    }
+#endif
 
     private IEnumerator Start()
     {
+        NormalizeDatasetSettings();
+
         if (!loadOnStart)
             yield break;
 
@@ -251,7 +342,6 @@ public class GaussianChunkManager : MonoBehaviour
     private void OnDestroy()
     {
         DestroyRuntimeMaterial(ref _pointMaterialFineInstance);
-        DestroyRuntimeMaterial(ref _pointMaterialCoarseInstance);
         DestroyRuntimeMaterial(ref _rawPointMaterialInstance);
     }
 
@@ -264,11 +354,138 @@ public class GaussianChunkManager : MonoBehaviour
         materialInstance = null;
     }
 
+    private void NormalizeDatasetSettings()
+    {
+        if (indoorDataset == null)
+            indoorDataset = new DatasetDefinition();
+
+        if (outdoorDataset == null)
+            outdoorDataset = new DatasetDefinition();
+
+        NormalizeDatasetDefinition(indoorDataset, "Indoor", DefaultIndoorChunksFolderName, DefaultIndoorUniformChunksFolderName);
+        NormalizeDatasetDefinition(outdoorDataset, "Outdoor", LatestOutdoorChunksFolderName, DefaultUniformChunksFolderName);
+
+        chunksFolderName = NormalizeLegacyFolderName(chunksFolderName);
+        if (string.IsNullOrWhiteSpace(chunksFolderName))
+            chunksFolderName = LatestOutdoorChunksFolderName;
+
+        if (string.IsNullOrWhiteSpace(lodIndexFileName))
+            lodIndexFileName = DefaultLodIndexFileName;
+
+        SyncSelectionFromCurrentFolder();
+    }
+
+    private static void NormalizeDatasetDefinition(
+        DatasetDefinition dataset,
+        string fallbackName,
+        string randomFallbackFolder,
+        string uniformFallbackFolder)
+    {
+        if (dataset == null)
+            return;
+
+        if (string.IsNullOrWhiteSpace(dataset.displayName))
+            dataset.displayName = fallbackName;
+
+        dataset.chunksFolderName = NormalizeLegacyFolderName(dataset.chunksFolderName);
+        dataset.randomChunksFolderName = NormalizeLegacyFolderName(dataset.randomChunksFolderName);
+        dataset.uniformChunksFolderName = NormalizeLegacyFolderName(dataset.uniformChunksFolderName);
+
+        if (string.IsNullOrWhiteSpace(dataset.randomChunksFolderName))
+            dataset.randomChunksFolderName = randomFallbackFolder;
+
+        if (string.IsNullOrWhiteSpace(dataset.uniformChunksFolderName))
+            dataset.uniformChunksFolderName = uniformFallbackFolder;
+
+        if (string.IsNullOrWhiteSpace(dataset.chunksFolderName))
+            dataset.chunksFolderName = dataset.randomChunksFolderName;
+
+        if (string.IsNullOrWhiteSpace(dataset.lodIndexFileName))
+            dataset.lodIndexFileName = DefaultLodIndexFileName;
+    }
+
+    private static string NormalizeLegacyFolderName(string folderName)
+    {
+        if (string.IsNullOrWhiteSpace(folderName))
+            return folderName;
+
+        if (string.Equals(folderName, "chunks_Indoordata", StringComparison.OrdinalIgnoreCase))
+            return DefaultIndoorChunksFolderName;
+
+        if (string.Equals(folderName, "chunks_TUMv2", StringComparison.OrdinalIgnoreCase))
+            return LatestOutdoorChunksFolderName;
+
+        return folderName;
+    }
+
+    private void SyncSelectionFromCurrentFolder()
+    {
+        if (MatchesDatasetFolder(indoorDataset, SamplingMode.Random))
+        {
+            activeDatasetMode = DatasetMode.Indoor;
+            activeSamplingMode = SamplingMode.Random;
+            return;
+        }
+
+        if (MatchesDatasetFolder(indoorDataset, SamplingMode.Uniform))
+        {
+            activeDatasetMode = DatasetMode.Indoor;
+            activeSamplingMode = SamplingMode.Uniform;
+            return;
+        }
+
+        if (MatchesDatasetFolder(outdoorDataset, SamplingMode.Random))
+        {
+            activeDatasetMode = DatasetMode.Outdoor;
+            activeSamplingMode = SamplingMode.Random;
+            return;
+        }
+
+        if (MatchesDatasetFolder(outdoorDataset, SamplingMode.Uniform))
+        {
+            activeDatasetMode = DatasetMode.Outdoor;
+            activeSamplingMode = SamplingMode.Uniform;
+        }
+    }
+
+    private DatasetDefinition GetDatasetDefinition(DatasetMode mode)
+    {
+        return mode == DatasetMode.Indoor ? indoorDataset : outdoorDataset;
+    }
+
+    private string GetChunksFolderForSelection(DatasetDefinition dataset, SamplingMode samplingMode)
+    {
+        if (dataset == null)
+            return "";
+
+        string folder = samplingMode == SamplingMode.Uniform
+            ? dataset.uniformChunksFolderName
+            : dataset.randomChunksFolderName;
+
+        return string.IsNullOrWhiteSpace(folder) ? dataset.chunksFolderName : folder;
+    }
+
+    private DatasetDefinition CreateDatasetFromCurrentSelection()
+    {
+        DatasetDefinition dataset = GetDatasetDefinition(activeDatasetMode);
+        string samplingLabel = activeSamplingMode == SamplingMode.Uniform ? "Uniform" : "Random";
+
+        return new DatasetDefinition
+        {
+            displayName = $"{dataset.displayName} / {samplingLabel}",
+            chunksFolderName = GetChunksFolderForSelection(dataset, activeSamplingMode),
+            randomChunksFolderName = dataset.randomChunksFolderName,
+            uniformChunksFolderName = dataset.uniformChunksFolderName,
+            lodIndexFileName = dataset.lodIndexFileName
+        };
+    }
+
     private void LoadLODIndex()
     {
         if (!TryLoadLODIndex(chunksFolderName, lodIndexFileName, out _lodIndex))
             return;
 
+        ClampActiveLodLevelToIndex();
         Debug.Log($"[GaussianChunkManager] Loaded LOD index, chunks={_lodIndex.chunks.Count}");
     }
 
@@ -276,7 +493,12 @@ public class GaussianChunkManager : MonoBehaviour
     {
         lodIndex = null;
 
-        var dir = Path.Combine(Application.streamingAssetsPath, folderName);
+        if (!TryResolveChunkDirectory(folderName, out var dir))
+        {
+            Debug.LogError($"[GaussianChunkManager] Chunk folder not found: {folderName}");
+            return false;
+        }
+
         var path = Path.Combine(dir, indexFileName);
 
         if (!File.Exists(path))
@@ -295,7 +517,52 @@ public class GaussianChunkManager : MonoBehaviour
             return false;
         }
 
+        _resolvedChunkDir = dir;
         return true;
+    }
+
+    private bool TryResolveChunkDirectory(string folderName, out string dir)
+    {
+        dir = "";
+
+        if (string.IsNullOrWhiteSpace(folderName))
+            return false;
+
+        if (Path.IsPathRooted(folderName))
+        {
+            dir = Path.GetFullPath(folderName);
+            return Directory.Exists(dir);
+        }
+
+        string streamingDir = Path.Combine(Application.streamingAssetsPath, folderName);
+        if (Directory.Exists(streamingDir))
+        {
+            dir = streamingDir;
+            return true;
+        }
+
+#if UNITY_EDITOR
+        if (allowProjectDataFolderFallback)
+        {
+            string unityProjectRoot = Directory.GetParent(Application.dataPath)?.FullName;
+            string repoRoot = string.IsNullOrEmpty(unityProjectRoot)
+                ? ""
+                : Directory.GetParent(unityProjectRoot)?.FullName;
+
+            if (!string.IsNullOrEmpty(repoRoot))
+            {
+                string dataDir = Path.Combine(repoRoot, "data", folderName);
+                if (Directory.Exists(dataDir))
+                {
+                    dir = dataDir;
+                    return true;
+                }
+            }
+        }
+#endif
+
+        dir = streamingDir;
+        return false;
     }
 
     private Material GetGaussianFineMaterial()
@@ -307,17 +574,6 @@ public class GaussianChunkManager : MonoBehaviour
             _pointMaterialFineInstance = new Material(pointMaterial);
 
         return _pointMaterialFineInstance;
-    }
-
-    private Material GetGaussianCoarseMaterial()
-    {
-        if (pointMaterial == null)
-            return null;
-
-        if (_pointMaterialCoarseInstance == null)
-            _pointMaterialCoarseInstance = new Material(pointMaterial);
-
-        return _pointMaterialCoarseInstance;
     }
 
     private Material GetRawPointMaterial()
@@ -364,27 +620,30 @@ public class GaussianChunkManager : MonoBehaviour
         _chunkRoot.rotation = Quaternion.identity;
         _chunkRoot.localScale = Vector3.one;
 
-        string chunkDir = Path.Combine(Application.streamingAssetsPath, chunksFolderName);
+        string chunkDir = string.IsNullOrEmpty(_resolvedChunkDir)
+            ? Path.Combine(Application.streamingAssetsPath, chunksFolderName)
+            : _resolvedChunkDir;
+
+        ClampActiveLodLevelToIndex();
 
         foreach (var entry in _lodIndex.chunks)
         {
-            if (entry == null || entry.count <= 0)
+            if (entry == null)
                 continue;
 
-            string l0File = GetLODFileName(entry, 0);
-            string l1File = GetLODFileName(entry, 1);
+            int fineLod = activeLodLevel;
+            string fineFile = GetLODFileName(entry, fineLod, fallbackToNearestAvailableLod);
 
-            if (string.IsNullOrEmpty(l0File) || string.IsNullOrEmpty(l1File))
+            if (string.IsNullOrEmpty(fineFile))
                 continue;
 
-            string fullL0 = Path.Combine(chunkDir, l0File);
-            string fullL1 = Path.Combine(chunkDir, l1File);
+            string fullFine = Path.Combine(chunkDir, fineFile);
 
-            if (!File.Exists(fullL0) || !File.Exists(fullL1))
+            if (!File.Exists(fullFine))
                 continue;
 
             if (logChunkInfo)
-                Debug.Log($"[GaussianChunkManager] {entry.filename ?? "chunk"}: L0={l0File}, L1={l1File}");
+                Debug.Log($"[GaussianChunkManager] {entry.filename ?? "chunk"}: L{fineLod}={fineFile}");
 
             string chunkName = $"Chunk_{entry.ijk[0]}_{entry.ijk[1]}_{entry.ijk[2]}";
             GameObject go = new GameObject(chunkName);
@@ -392,30 +651,22 @@ public class GaussianChunkManager : MonoBehaviour
 
             var fine = go.AddComponent<GaussianLoader>();
             fine.treatInputAsWorldSpace = true;
-            fine.dataFileName = Path.Combine(chunksFolderName, l0File);
-
-            var coarseGO = new GameObject(chunkName + "_Coarse");
-            coarseGO.transform.SetParent(go.transform, false);
-            var coarse = coarseGO.AddComponent<GaussianLoader>();
-            coarse.treatInputAsWorldSpace = true;
-            coarse.dataFileName = Path.Combine(chunksFolderName, l1File);
+            fine.dataFileName = fullFine;
 
             ApplyFineParams(fine);
-            ApplyCoarseParams(coarse);
 
             fine.enabled = false;
-            coarse.enabled = false;
 
             _chunkLoaders.Add(fine);
-            _chunkLoadersCoarse.Add(coarse);
             _chunkEntries.Add(entry);
             _chunkVisibility.Add(true);
             _isChunkLoaded.Add(false);
             _isFineLoaded.Add(false);
-            _isCoarseLoaded.Add(false);
+            _fineLodLevels.Add(fineLod);
         }
 
         _lastDisplayMode = currentDisplayMode;
+        _lastActiveLodLevel = activeLodLevel;
     }
 
     private void ClearActiveChunks()
@@ -428,11 +679,6 @@ public class GaussianChunkManager : MonoBehaviour
                 _chunkLoaders[i].enabled = false;
             }
 
-            if (_chunkLoadersCoarse[i] != null)
-            {
-                _chunkLoadersCoarse[i].UnloadData();
-                _chunkLoadersCoarse[i].enabled = false;
-            }
         }
 
         if (_chunkRoot != null)
@@ -446,15 +692,14 @@ public class GaussianChunkManager : MonoBehaviour
         }
 
         _chunkLoaders.Clear();
-        _chunkLoadersCoarse.Clear();
         _chunkEntries.Clear();
         _chunkVisibility.Clear();
         _isChunkLoaded.Clear();
         _isFineLoaded.Clear();
-        _isCoarseLoaded.Clear();
+        _fineLodLevels.Clear();
     }
 
-    private void ConfigureLoaderForCurrentMode(GaussianLoader loader, bool isCoarsePass)
+    private void ConfigureLoaderForCurrentMode(GaussianLoader loader)
     {
         if (loader == null)
             return;
@@ -465,7 +710,7 @@ public class GaussianChunkManager : MonoBehaviour
 
         if (UseGaussianSplatMode)
         {
-            baseMaterial = isCoarsePass ? GetGaussianCoarseMaterial() : GetGaussianFineMaterial();
+            baseMaterial = GetGaussianFineMaterial();
             drawAsSplat = renderAsSplatQuads;
             useOIT = renderAsSplatQuads;
         }
@@ -480,60 +725,62 @@ public class GaussianChunkManager : MonoBehaviour
             loader.ConfigureRendering(baseMaterial, drawAsSplat, useOIT);
     }
 
+    private float GetPointSizeForLod(int lodLevel)
+    {
+        switch (lodLevel)
+        {
+            case 0: return pointSizeL0;
+            case 1: return pointSizeL1;
+            case 2: return pointSizeL2;
+            case 3: return pointSizeL3;
+            case 4: return pointSizeL4;
+            default: return pointSizeL0;
+        }
+    }
+
+    private float GetOpacityForLod(int lodLevel)
+    {
+        switch (lodLevel)
+        {
+            case 0: return opacityL0;
+            case 1: return opacityL1;
+            case 2: return opacityL2;
+            case 3: return opacityL3;
+            case 4: return opacityL4;
+            default: return opacityL0;
+        }
+    }
+
+    private float GetSigmaCutoffForLod(int lodLevel)
+    {
+        switch (lodLevel)
+        {
+            case 0: return sigmaCutoffL0;
+            case 1: return sigmaCutoffL1;
+            case 2: return sigmaCutoffL2;
+            case 3: return sigmaCutoffL3;
+            case 4: return sigmaCutoffL4;
+            default: return sigmaCutoffL0;
+        }
+    }
+
     private void ApplyFineParams(GaussianLoader loader)
     {
         if (loader == null) return;
 
-        ConfigureLoaderForCurrentMode(loader, false);
+        ConfigureLoaderForCurrentMode(loader);
 
         if (UseGaussianSplatMode)
         {
-            loader.pointSize = pointSizeL0;
-            loader.opacity = opacityL0;
-            loader.sigmaCutoff = sigmaCutoffL0;
+            int lodLevel = Mathf.Clamp(activeLodLevel, 0, 4);
+            loader.pointSize = GetPointSizeForLod(lodLevel);
+            loader.opacity = GetOpacityForLod(lodLevel);
+            loader.sigmaCutoff = GetSigmaCutoffForLod(lodLevel);
             loader.minAxisPixels = minAxisPixels;
             loader.maxAxisPixels = maxAxisPixels;
-            loader.pointSizeMultiplier = 1.0f;
-            loader.opacityMultiplier = 1.0f;
-            loader.enableViewZFade = UseScaleMixtureForCurrentMode;
-            loader.viewZFadeStart = mixtureStart;
-            loader.viewZFadeEnd = mixtureEnd;
-            loader.viewZFadeExponent = 1.0f;
-            loader.invertViewZFade = true;
-        }
-        else
-        {
-            loader.pointSize = rawPointSize;
-            loader.opacity = 1.0f;
-            loader.sigmaCutoff = 1.0f;
-            loader.minAxisPixels = 0.0f;
-            loader.maxAxisPixels = 0.0f;
             loader.pointSizeMultiplier = 1.0f;
             loader.opacityMultiplier = 1.0f;
             loader.enableViewZFade = false;
-            loader.invertViewZFade = false;
-        }
-    }
-
-    private void ApplyCoarseParams(GaussianLoader loader)
-    {
-        if (loader == null) return;
-
-        ConfigureLoaderForCurrentMode(loader, true);
-
-        if (UseGaussianSplatMode)
-        {
-            loader.pointSize = pointSizeL1;
-            loader.opacity = opacityL1;
-            loader.sigmaCutoff = sigmaCutoffL1;
-            loader.minAxisPixels = minAxisPixels;
-            loader.maxAxisPixels = maxAxisPixels;
-            loader.pointSizeMultiplier = coarsePointSizeMultiplier;
-            loader.opacityMultiplier = coarseOpacityMultiplier;
-            loader.enableViewZFade = UseScaleMixtureForCurrentMode;
-            loader.viewZFadeStart = mixtureStart;
-            loader.viewZFadeEnd = mixtureEnd;
-            loader.viewZFadeExponent = 1.0f;
             loader.invertViewZFade = false;
         }
         else
@@ -554,10 +801,12 @@ public class GaussianChunkManager : MonoBehaviour
     {
         if (_lastDisplayMode != currentDisplayMode) return true;
         if (_lastRenderAsSplatQuads != renderAsSplatQuads) return true;
-        if (_lastScaleMixture != enableScaleMixture) return true;
         if (!Mathf.Approximately(_lastPointSizeL0, pointSizeL0) || !Mathf.Approximately(_lastPointSizeL1, pointSizeL1)) return true;
+        if (!Mathf.Approximately(_lastPointSizeL2, pointSizeL2) || !Mathf.Approximately(_lastPointSizeL3, pointSizeL3) || !Mathf.Approximately(_lastPointSizeL4, pointSizeL4)) return true;
         if (!Mathf.Approximately(_lastOpacityL0, opacityL0) || !Mathf.Approximately(_lastOpacityL1, opacityL1)) return true;
+        if (!Mathf.Approximately(_lastOpacityL2, opacityL2) || !Mathf.Approximately(_lastOpacityL3, opacityL3) || !Mathf.Approximately(_lastOpacityL4, opacityL4)) return true;
         if (!Mathf.Approximately(_lastSigmaL0, sigmaCutoffL0) || !Mathf.Approximately(_lastSigmaL1, sigmaCutoffL1)) return true;
+        if (!Mathf.Approximately(_lastSigmaL2, sigmaCutoffL2) || !Mathf.Approximately(_lastSigmaL3, sigmaCutoffL3) || !Mathf.Approximately(_lastSigmaL4, sigmaCutoffL4)) return true;
         if (!Mathf.Approximately(_lastMinAxisPx, minAxisPixels) || !Mathf.Approximately(_lastMaxAxisPx, maxAxisPixels)) return true;
         if (!Mathf.Approximately(_lastRawPointSize, rawPointSize)) return true;
 
@@ -568,13 +817,22 @@ public class GaussianChunkManager : MonoBehaviour
     {
         _lastDisplayMode = currentDisplayMode;
         _lastRenderAsSplatQuads = renderAsSplatQuads;
-        _lastScaleMixture = enableScaleMixture;
+        _lastActiveLodLevel = activeLodLevel;
         _lastPointSizeL0 = pointSizeL0;
         _lastPointSizeL1 = pointSizeL1;
+        _lastPointSizeL2 = pointSizeL2;
+        _lastPointSizeL3 = pointSizeL3;
+        _lastPointSizeL4 = pointSizeL4;
         _lastOpacityL0 = opacityL0;
         _lastOpacityL1 = opacityL1;
+        _lastOpacityL2 = opacityL2;
+        _lastOpacityL3 = opacityL3;
+        _lastOpacityL4 = opacityL4;
         _lastSigmaL0 = sigmaCutoffL0;
         _lastSigmaL1 = sigmaCutoffL1;
+        _lastSigmaL2 = sigmaCutoffL2;
+        _lastSigmaL3 = sigmaCutoffL3;
+        _lastSigmaL4 = sigmaCutoffL4;
         _lastMinAxisPx = minAxisPixels;
         _lastMaxAxisPx = maxAxisPixels;
         _lastRawPointSize = rawPointSize;
@@ -583,10 +841,7 @@ public class GaussianChunkManager : MonoBehaviour
     private void ApplyParamsToAllLoaders()
     {
         for (int i = 0; i < _chunkLoaders.Count; i++)
-        {
             ApplyFineParams(_chunkLoaders[i]);
-            ApplyCoarseParams(_chunkLoadersCoarse[i]);
-        }
 
         CacheRenderParams();
     }
@@ -598,30 +853,135 @@ public class GaussianChunkManager : MonoBehaviour
 
         currentDisplayMode = mode;
         ApplyParamsToAllLoaders();
-
-        for (int i = 0; i < _chunkLoaders.Count; i++)
-        {
-            if (!UseGaussianSplatMode && _isCoarseLoaded[i])
-            {
-                _chunkLoadersCoarse[i].UnloadData();
-                _chunkLoadersCoarse[i].enabled = false;
-                _isCoarseLoaded[i] = false;
-            }
-        }
     }
 
     public void SwitchToIndoorDataset()
     {
-        SwitchDataset(indoorDataset);
+        NormalizeDatasetSettings();
+        activeDatasetMode = DatasetMode.Indoor;
+        SwitchDataset(CreateDatasetFromCurrentSelection(), recenterCamera: true);
     }
 
     public void SwitchToOutdoorDataset()
     {
-        SwitchDataset(outdoorDataset);
+        NormalizeDatasetSettings();
+        activeDatasetMode = DatasetMode.Outdoor;
+        SwitchDataset(CreateDatasetFromCurrentSelection(), recenterCamera: true);
+    }
+
+    public void SwitchToRandomSampling()
+    {
+        NormalizeDatasetSettings();
+        activeSamplingMode = SamplingMode.Random;
+        SwitchDataset(CreateDatasetFromCurrentSelection(), recenterCamera: false);
+    }
+
+    public void SwitchToUniformSampling()
+    {
+        NormalizeDatasetSettings();
+        activeSamplingMode = SamplingMode.Uniform;
+        SwitchDataset(CreateDatasetFromCurrentSelection(), recenterCamera: false);
+    }
+
+    [ContextMenu("Use Indoor Data")]
+    private void UseIndoorDatasetFromInspector()
+    {
+        NormalizeDatasetSettings();
+        activeDatasetMode = DatasetMode.Indoor;
+        SelectCurrentDatasetFromInspector(recenterCamera: true);
+    }
+
+    [ContextMenu("Use Outdoor Data")]
+    private void UseOutdoorDatasetFromInspector()
+    {
+        NormalizeDatasetSettings();
+        activeDatasetMode = DatasetMode.Outdoor;
+        SelectCurrentDatasetFromInspector(recenterCamera: true);
+    }
+
+    [ContextMenu("Use Random Sampling")]
+    private void UseRandomSamplingFromInspector()
+    {
+        NormalizeDatasetSettings();
+        activeSamplingMode = SamplingMode.Random;
+        SelectCurrentDatasetFromInspector(recenterCamera: false);
+    }
+
+    [ContextMenu("Use Uniform Sampling")]
+    private void UseUniformSamplingFromInspector()
+    {
+        NormalizeDatasetSettings();
+        activeSamplingMode = SamplingMode.Uniform;
+        SelectCurrentDatasetFromInspector(recenterCamera: false);
+    }
+
+    private void SelectCurrentDatasetFromInspector(bool recenterCamera)
+    {
+        DatasetDefinition dataset = CreateDatasetFromCurrentSelection();
+        chunksFolderName = dataset.chunksFolderName;
+        lodIndexFileName = dataset.lodIndexFileName;
+
+        if (Application.isPlaying)
+            SwitchDataset(dataset, recenterCamera);
+    }
+
+    public void SetGaussianSplatMode()
+    {
+        SetDisplayMode(DisplayMode.GaussianSplat);
+    }
+
+    public void SetRawPointCloudMode()
+    {
+        SetDisplayMode(DisplayMode.RawPointCloud);
+    }
+
+    public void SetActiveLODLevel(int lodLevel)
+    {
+        if (_lodIndex == null)
+        {
+            activeLodLevel = Mathf.Clamp(lodLevel, 0, 4);
+            _lastActiveLodLevel = activeLodLevel;
+            return;
+        }
+
+        int clamped = ClampLodLevelToIndex(lodLevel);
+        if (activeLodLevel == clamped && _lastActiveLodLevel == clamped)
+            return;
+
+        activeLodLevel = clamped;
+        RebindLODFilesForAllChunks();
+        ApplyParamsToAllLoaders();
+        _lastActiveLodLevel = activeLodLevel;
+
+        if (logLODChanges)
+            Debug.Log($"[GaussianChunkManager] Active LOD switched to L{activeLodLevel}");
+    }
+
+    public void SetLOD0() => SetActiveLODLevel(0);
+    public void SetLOD1() => SetActiveLODLevel(1);
+    public void SetLOD2() => SetActiveLODLevel(2);
+    public void SetLOD3() => SetActiveLODLevel(3);
+    public void SetLOD4() => SetActiveLODLevel(4);
+
+    public void NextLODLevel()
+    {
+        SetActiveLODLevel(activeLodLevel + 1);
+    }
+
+    public void PreviousLODLevel()
+    {
+        SetActiveLODLevel(activeLodLevel - 1);
     }
 
     public void ReloadCurrentDataset()
     {
+        ReloadCurrentDataset(recenterCamera: true);
+    }
+
+    public void ReloadCurrentDataset(bool recenterCamera)
+    {
+        NormalizeDatasetSettings();
+
         var currentDataset = new DatasetDefinition
         {
             displayName = CurrentDatasetLabel,
@@ -629,10 +989,27 @@ public class GaussianChunkManager : MonoBehaviour
             lodIndexFileName = lodIndexFileName
         };
 
-        SwitchDataset(currentDataset);
+        SwitchDataset(currentDataset, recenterCamera);
     }
 
-    private void SwitchDataset(DatasetDefinition dataset)
+    public void RecenterToCurrentDataset()
+    {
+        if (!recenterCameraOnDatasetSwitch)
+        {
+            Debug.LogWarning("[GaussianChunkManager] recenterCameraOnDatasetSwitch is disabled.");
+            return;
+        }
+
+        if (_lodIndex == null)
+        {
+            if (!TryLoadLODIndex(chunksFolderName, lodIndexFileName, out _lodIndex))
+                return;
+        }
+
+        RecenterMainCameraToDataset(_lodIndex);
+    }
+
+    private void SwitchDataset(DatasetDefinition dataset, bool recenterCamera)
     {
         if (dataset == null)
         {
@@ -656,7 +1033,7 @@ public class GaussianChunkManager : MonoBehaviour
         InitChunks();
         ApplyParamsToAllLoaders();
 
-        if (recenterCameraOnDatasetSwitch)
+        if (recenterCamera && recenterCameraOnDatasetSwitch)
             RecenterMainCameraToDataset(_lodIndex);
 
         Debug.Log($"[GaussianChunkManager] Switched dataset to {dataset.displayName} ({dataset.chunksFolderName})");
@@ -674,6 +1051,41 @@ public class GaussianChunkManager : MonoBehaviour
         {
             SetDisplayMode(UseGaussianSplatMode ? DisplayMode.RawPointCloud : DisplayMode.GaussianSplat);
         }
+    }
+
+    private void HandleLodSwitchInput()
+    {
+        if (disableKeyboardToggleWhenXRActive && IsXRSceneActive())
+            return;
+
+        if (!allowKeyboardLodSwitch || Keyboard.current == null)
+            return;
+
+        if (Keyboard.current.digit1Key.wasPressedThisFrame) SetActiveLODLevel(0);
+        if (Keyboard.current.digit2Key.wasPressedThisFrame) SetActiveLODLevel(1);
+        if (Keyboard.current.digit3Key.wasPressedThisFrame) SetActiveLODLevel(2);
+        if (Keyboard.current.digit4Key.wasPressedThisFrame) SetActiveLODLevel(3);
+        if (Keyboard.current.digit5Key.wasPressedThisFrame) SetActiveLODLevel(4);
+    }
+
+    private void HandleLodInspectorChanges()
+    {
+        if (_lodIndex == null)
+            return;
+
+        int clamped = ClampLodLevelToIndex(activeLodLevel);
+        if (activeLodLevel != clamped)
+            activeLodLevel = clamped;
+
+        if (_lastActiveLodLevel == activeLodLevel)
+            return;
+
+        RebindLODFilesForAllChunks();
+        ApplyParamsToAllLoaders();
+        _lastActiveLodLevel = activeLodLevel;
+
+        if (logLODChanges)
+            Debug.Log($"[GaussianChunkManager] Active LOD changed to L{activeLodLevel}");
     }
 
     private bool IsChunkVisible(Plane[] planes, Vector3 bmin, Vector3 bmax)
@@ -709,42 +1121,328 @@ public class GaussianChunkManager : MonoBehaviour
         return Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    private string GetLODFileName(ChunkEntry entry, int lodLevel)
+    private int[] GetAvailableLodLevels()
     {
-        if (entry.lod != null)
+        if (_lodIndex != null && _lodIndex.lod_levels != null && _lodIndex.lod_levels.Length > 0)
+            return _lodIndex.lod_levels;
+
+        return new[] { 0 };
+    }
+
+    public string GetLODLayerInfoLabel(int lodLevel)
+    {
+        GaussianLODManifestLevel level = GetManifestLevel(lodLevel);
+        int count = GetLODPointCount(lodLevel, level);
+        string pointCount = FormatPointCount(count);
+
+        if (IsUniformLod(level))
         {
-            if (lodLevel == 0 && entry.lod.L0 != null && !string.IsNullOrEmpty(entry.lod.L0.filename))
-                return entry.lod.L0.filename;
-            if (lodLevel == 1 && entry.lod.L1 != null && !string.IsNullOrEmpty(entry.lod.L1.filename))
-                return entry.lod.L1.filename;
-            if (lodLevel == 2 && entry.lod.L2 != null && !string.IsNullOrEmpty(entry.lod.L2.filename))
-                return entry.lod.L2.filename;
+            string resolution = GetSamplingParameterLabel(level);
+            return string.IsNullOrEmpty(resolution)
+                ? $"L{lodLevel}: {pointCount} points"
+                : $"L{lodLevel}: {resolution}, {pointCount} points";
         }
 
-        if (entry.lod != null && entry.lod.L0 != null && !string.IsNullOrEmpty(entry.lod.L0.filename))
-            return entry.lod.L0.filename;
+        return $"L{lodLevel}: {pointCount} points";
+    }
 
-        return entry.filename;
+    private GaussianLODManifestLevel GetManifestLevel(int lodLevel)
+    {
+        var levels = _lodIndex?.gaussian_lod_manifest?.levels;
+        if (levels == null)
+            return null;
+
+        for (int i = 0; i < levels.Count; i++)
+        {
+            if (levels[i] != null && levels[i].level == lodLevel)
+                return levels[i];
+        }
+
+        return null;
+    }
+
+    private bool IsUniformLod(GaussianLODManifestLevel level)
+    {
+        if (level != null && !string.IsNullOrEmpty(level.sampling_method))
+            return string.Equals(level.sampling_method, "uniform", StringComparison.OrdinalIgnoreCase);
+
+        return activeSamplingMode == SamplingMode.Uniform;
+    }
+
+    private string GetSamplingParameterLabel(GaussianLODManifestLevel level)
+    {
+        if (level == null)
+            return "";
+
+        if (!string.IsNullOrWhiteSpace(level.sampling_parameter_label))
+            return level.sampling_parameter_label;
+
+        if (string.Equals(level.sampling_parameter_name, "resolution_m", StringComparison.OrdinalIgnoreCase))
+            return FormatResolutionMeters(level.sampling_parameter_value);
+
+        if (string.Equals(level.sampling_parameter_name, "point_count", StringComparison.OrdinalIgnoreCase))
+            return FormatPointCount(Mathf.RoundToInt(level.sampling_parameter_value));
+
+        return "";
+    }
+
+    private int GetLODPointCount(int lodLevel, GaussianLODManifestLevel level)
+    {
+        if (level != null && level.num_points > 0)
+            return level.num_points;
+
+        if (_lodIndex == null || _lodIndex.chunks == null)
+            return 0;
+
+        int arrayIndex = GetLodArrayIndex(lodLevel);
+        long total = 0;
+
+        for (int i = 0; i < _lodIndex.chunks.Count; i++)
+        {
+            ChunkEntry chunk = _lodIndex.chunks[i];
+            if (chunk == null)
+                continue;
+
+            if (chunk.lod_counts != null && arrayIndex >= 0 && arrayIndex < chunk.lod_counts.Length)
+                total += Mathf.Max(0, chunk.lod_counts[arrayIndex]);
+            else if (lodLevel == 0)
+                total += Mathf.Max(0, chunk.count);
+        }
+
+        return total > int.MaxValue ? int.MaxValue : (int)total;
+    }
+
+    private static string FormatPointCount(int count)
+    {
+        if (count <= 0)
+            return "0";
+
+        if (count >= 1000000)
+            return $"{count / 1000000f:0.##}M";
+
+        if (count >= 1000)
+            return $"{count / 1000f:0.#}K";
+
+        return count.ToString();
+    }
+
+    private static string FormatResolutionMeters(float meters)
+    {
+        if (meters <= 0f)
+            return "";
+
+        if (meters < 1f)
+            return $"{meters * 100f:0.##}cm";
+
+        return $"{meters:0.##}m";
+    }
+
+    private int ClampLodLevelToIndex(int lodLevel)
+    {
+        int[] levels = GetAvailableLodLevels();
+        if (levels == null || levels.Length == 0)
+            return Mathf.Clamp(lodLevel, 0, 4);
+
+        int nearest = levels[0];
+        int bestDistance = Mathf.Abs(lodLevel - nearest);
+        for (int i = 1; i < levels.Length; i++)
+        {
+            int distance = Mathf.Abs(lodLevel - levels[i]);
+            if (distance < bestDistance)
+            {
+                nearest = levels[i];
+                bestDistance = distance;
+            }
+        }
+
+        return nearest;
+    }
+
+    private void ClampActiveLodLevelToIndex()
+    {
+        activeLodLevel = ClampLodLevelToIndex(activeLodLevel);
+        _lastActiveLodLevel = activeLodLevel;
+    }
+
+    private LODLevel GetExplicitLODLevel(ChunkEntry entry, int lodLevel)
+    {
+        if (entry == null || entry.lod == null)
+            return null;
+
+        switch (lodLevel)
+        {
+            case 0: return entry.lod.L0;
+            case 1: return entry.lod.L1;
+            case 2: return entry.lod.L2;
+            case 3: return entry.lod.L3;
+            case 4: return entry.lod.L4;
+            default: return null;
+        }
+    }
+
+    private int GetLodArrayIndex(int lodLevel)
+    {
+        if (_lodIndex == null || _lodIndex.lod_levels == null || _lodIndex.lod_levels.Length == 0)
+            return lodLevel;
+
+        for (int i = 0; i < _lodIndex.lod_levels.Length; i++)
+        {
+            if (_lodIndex.lod_levels[i] == lodLevel)
+                return i;
+        }
+
+        return -1;
+    }
+
+    private string GetDirectLODFileName(ChunkEntry entry, int lodLevel)
+    {
+        if (entry == null)
+            return "";
+
+        int arrayIndex = GetLodArrayIndex(lodLevel);
+        if (entry.lod_files != null && arrayIndex >= 0 && arrayIndex < entry.lod_files.Length)
+        {
+            string file = entry.lod_files[arrayIndex];
+            if (!string.IsNullOrEmpty(file))
+                return file;
+        }
+
+        if (entry.lod != null)
+        {
+            LODLevel level = GetExplicitLODLevel(entry, lodLevel);
+            if (level != null && !string.IsNullOrEmpty(level.filename))
+                return level.filename;
+        }
+
+        if (lodLevel == 0 && !string.IsNullOrEmpty(entry.filename))
+            return entry.filename;
+
+        return "";
+    }
+
+    private string GetLODFileName(ChunkEntry entry, int lodLevel, bool allowFallback)
+    {
+        string direct = GetDirectLODFileName(entry, lodLevel);
+        if (!string.IsNullOrEmpty(direct) || !allowFallback)
+            return direct;
+
+        int[] levels = GetAvailableLodLevels();
+        string bestFile = "";
+        int bestDistance = int.MaxValue;
+
+        if (levels != null)
+        {
+            for (int i = 0; i < levels.Length; i++)
+            {
+                string candidate = GetDirectLODFileName(entry, levels[i]);
+                if (string.IsNullOrEmpty(candidate))
+                    continue;
+
+                int distance = Mathf.Abs(lodLevel - levels[i]);
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    bestFile = candidate;
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(bestFile))
+            return bestFile;
+
+        return GetDirectLODFileName(entry, 0);
+    }
+
+    private void RebindLODFilesForAllChunks()
+    {
+        if (_lodIndex == null || _chunkLoaders.Count == 0)
+            return;
+
+        string chunkDir = string.IsNullOrEmpty(_resolvedChunkDir)
+            ? Path.Combine(Application.streamingAssetsPath, chunksFolderName)
+            : _resolvedChunkDir;
+
+        for (int i = 0; i < _chunkLoaders.Count; i++)
+        {
+            GaussianLoader fine = _chunkLoaders[i];
+            ChunkEntry entry = _chunkEntries[i];
+
+            if (fine == null || entry == null)
+                continue;
+
+            if (_isFineLoaded[i])
+            {
+                fine.UnloadData();
+                _isFineLoaded[i] = false;
+            }
+
+            string fineFile = GetLODFileName(entry, activeLodLevel, fallbackToNearestAvailableLod);
+            fine.dataFileName = string.IsNullOrEmpty(fineFile) ? "" : Path.Combine(chunkDir, fineFile);
+            fine.enabled = false;
+            _fineLodLevels[i] = activeLodLevel;
+
+            _isChunkLoaded[i] = false;
+        }
     }
 
     private string GetDatasetLabelForCurrentSelection()
     {
-        if (MatchesDataset(indoorDataset))
-            return indoorDataset.displayName;
+        if (MatchesCurrentSelection())
+            return CreateDatasetFromCurrentSelection().displayName;
 
-        if (MatchesDataset(outdoorDataset))
-            return outdoorDataset.displayName;
+        if (MatchesDatasetFolder(indoorDataset, SamplingMode.Random))
+            return $"{indoorDataset.displayName} / Random";
+
+        if (MatchesDatasetFolder(indoorDataset, SamplingMode.Uniform))
+            return $"{indoorDataset.displayName} / Uniform";
+
+        if (MatchesDatasetFolder(outdoorDataset, SamplingMode.Random))
+            return $"{outdoorDataset.displayName} / Random";
+
+        if (MatchesDatasetFolder(outdoorDataset, SamplingMode.Uniform))
+            return $"{outdoorDataset.displayName} / Uniform";
 
         return chunksFolderName;
     }
 
-    private bool MatchesDataset(DatasetDefinition dataset)
+    public bool IsDataModeSelected(DatasetMode mode)
+    {
+        return activeDatasetMode == mode && MatchesCurrentSelection();
+    }
+
+    public bool IsSamplingModeSelected(SamplingMode mode)
+    {
+        return activeSamplingMode == mode && MatchesCurrentSelection();
+    }
+
+    public bool MatchesDataset(DatasetDefinition dataset)
     {
         if (dataset == null)
             return false;
 
-        return string.Equals(chunksFolderName, dataset.chunksFolderName, StringComparison.OrdinalIgnoreCase)
+        return (MatchesDatasetFolder(dataset, SamplingMode.Random) || MatchesDatasetFolder(dataset, SamplingMode.Uniform))
                && string.Equals(lodIndexFileName, dataset.lodIndexFileName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public bool MatchesSampling(SamplingMode samplingMode)
+    {
+        return activeSamplingMode == samplingMode && MatchesCurrentSelection();
+    }
+
+    private bool MatchesCurrentSelection()
+    {
+        DatasetDefinition dataset = GetDatasetDefinition(activeDatasetMode);
+        return MatchesDatasetFolder(dataset, activeSamplingMode)
+               && string.Equals(lodIndexFileName, dataset.lodIndexFileName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool MatchesDatasetFolder(DatasetDefinition dataset, SamplingMode samplingMode)
+    {
+        if (dataset == null)
+            return false;
+
+        string folder = GetChunksFolderForSelection(dataset, samplingMode);
+        return string.Equals(chunksFolderName, folder, StringComparison.OrdinalIgnoreCase);
     }
 
     private bool TryGetDatasetBounds(LODIndex lodIndex, out Vector3 boundsMin, out Vector3 boundsMax)
@@ -806,13 +1504,28 @@ public class GaussianChunkManager : MonoBehaviour
         {
             float floorY = boundsMin.y;
             float eyeY = floorY + Mathf.Max(0f, xrStandingEyeHeight) + xrAdditionalHeightOffset;
-            targetPosition = new Vector3(center.x, eyeY, center.z - cameraDistance);
+            Vector3 centerPlacement = new Vector3(
+                center.x + xrPlanarOffsetFromCenter.x,
+                eyeY,
+                center.z + xrPlanarOffsetFromCenter.y);
 
-            Vector3 lookTarget = xrKeepLevelViewOnRecenter
-                ? new Vector3(center.x, eyeY, center.z)
-                : center;
+            targetPosition = xrPlaceUserNearDatasetCenter
+                ? centerPlacement
+                : new Vector3(center.x, eyeY, center.z - cameraDistance);
 
-            targetRotation = Quaternion.LookRotation(lookTarget - targetPosition, Vector3.up);
+            if (xrKeepLevelViewOnRecenter)
+            {
+                targetRotation = GetCurrentLevelFacing(mainCamera, xrRoot);
+            }
+            else
+            {
+                Vector3 lookTarget = new Vector3(center.x, eyeY, center.z);
+                Vector3 lookDirection = lookTarget - targetPosition;
+                if (lookDirection.sqrMagnitude < 1e-4f)
+                    targetRotation = GetCurrentLevelFacing(mainCamera, xrRoot);
+                else
+                    targetRotation = Quaternion.LookRotation(lookDirection, Vector3.up);
+            }
         }
         else
         {
@@ -834,6 +1547,23 @@ public class GaussianChunkManager : MonoBehaviour
         }
 
         mainCamera.transform.SetPositionAndRotation(targetPosition, targetRotation);
+    }
+
+    private Quaternion GetCurrentLevelFacing(Camera mainCamera, Transform xrRoot)
+    {
+        Vector3 forward = mainCamera != null ? mainCamera.transform.forward : Vector3.forward;
+        forward.y = 0f;
+
+        if (forward.sqrMagnitude < 1e-4f && xrRoot != null)
+        {
+            forward = xrRoot.forward;
+            forward.y = 0f;
+        }
+
+        if (forward.sqrMagnitude < 1e-4f)
+            forward = Vector3.forward;
+
+        return Quaternion.LookRotation(forward.normalized, Vector3.up);
     }
 
     private bool IsXRSceneActive()
@@ -888,6 +1618,8 @@ public class GaussianChunkManager : MonoBehaviour
     private void Update()
     {
         HandleModeToggleInput();
+        HandleLodSwitchInput();
+        HandleLodInspectorChanges();
 
         if (RenderParamsChanged())
             ApplyParamsToAllLoaders();
@@ -903,12 +1635,9 @@ public class GaussianChunkManager : MonoBehaviour
         if (unloadRadius < loadRadius)
             unloadRadius = loadRadius + 1f;
 
-        float hMix = Mathf.Max(0f, mixtureHysteresis);
-
         for (int i = 0; i < _chunkLoaders.Count; i++)
         {
             var fine = _chunkLoaders[i];
-            var coarse = _chunkLoadersCoarse[i];
             var entry = _chunkEntries[i];
 
             if (fine == null || entry == null || entry.bbox_min == null || entry.bbox_max == null)
@@ -938,11 +1667,9 @@ public class GaussianChunkManager : MonoBehaviour
             if (_isChunkLoaded[i] && shouldUnloadChunk)
             {
                 if (_isFineLoaded[i]) { fine.UnloadData(); _isFineLoaded[i] = false; }
-                if (_isCoarseLoaded[i]) { coarse.UnloadData(); _isCoarseLoaded[i] = false; }
 
                 _isChunkLoaded[i] = false;
                 fine.enabled = false;
-                coarse.enabled = false;
 
                 if (logStreamingChanges)
                     Debug.Log($"[Streaming] Unload {fine.gameObject.name} (aabb={distAabb:F1}m, center={distCenter:F1}m)");
@@ -953,18 +1680,11 @@ public class GaussianChunkManager : MonoBehaviour
             if (!shouldLoadChunk && !_isChunkLoaded[i])
             {
                 fine.enabled = false;
-                coarse.enabled = false;
                 continue;
             }
 
-            bool wantFine = true;
-            bool wantCoarse = false;
-
-            if (UseScaleMixtureForCurrentMode)
-            {
-                wantFine = _isFineLoaded[i] ? (distCenter <= (mixtureEnd + hMix)) : (distCenter < (mixtureEnd - hMix));
-                wantCoarse = _isCoarseLoaded[i] ? (distCenter >= (mixtureStart - hMix)) : (distCenter > (mixtureStart + hMix));
-            }
+            bool hasFineFile = !string.IsNullOrEmpty(fine.dataFileName);
+            bool wantFine = hasFineFile;
 
             if (!_isChunkLoaded[i] && shouldLoadChunk)
                 _isChunkLoaded[i] = true;
@@ -977,7 +1697,7 @@ public class GaussianChunkManager : MonoBehaviour
                 reloadsThisFrame++;
 
                 if (logStreamingChanges)
-                    Debug.Log($"[PassLoad] Fine load {fine.gameObject.name} (center={distCenter:F1}m)");
+                    Debug.Log($"[Streaming] Load {fine.gameObject.name} (center={distCenter:F1}m)");
             }
             else if (!wantFine && _isFineLoaded[i])
             {
@@ -985,33 +1705,12 @@ public class GaussianChunkManager : MonoBehaviour
                 _isFineLoaded[i] = false;
 
                 if (logStreamingChanges)
-                    Debug.Log($"[PassUnload] Fine unload {fine.gameObject.name} (center={distCenter:F1}m)");
-            }
-
-            if (wantCoarse && !_isCoarseLoaded[i] && reloadsThisFrame < Mathf.Max(0, maxReloadsPerFrame))
-            {
-                ApplyCoarseParams(coarse);
-                coarse.ReloadData();
-                _isCoarseLoaded[i] = true;
-                reloadsThisFrame++;
-
-                if (logStreamingChanges)
-                    Debug.Log($"[PassLoad] Coarse load {fine.gameObject.name} (center={distCenter:F1}m)");
-            }
-            else if (!wantCoarse && _isCoarseLoaded[i])
-            {
-                coarse.UnloadData();
-                _isCoarseLoaded[i] = false;
-
-                if (logStreamingChanges)
-                    Debug.Log($"[PassUnload] Coarse unload {fine.gameObject.name} (center={distCenter:F1}m)");
+                    Debug.Log($"[Streaming] Unload {fine.gameObject.name} (center={distCenter:F1}m)");
             }
 
             fine.enabled = visible && _isFineLoaded[i];
-            coarse.enabled = visible && _isCoarseLoaded[i];
 
             if (_isFineLoaded[i]) ApplyFineParams(fine);
-            if (_isCoarseLoaded[i]) ApplyCoarseParams(coarse);
         }
     }
 
@@ -1030,7 +1729,7 @@ public class GaussianChunkManager : MonoBehaviour
         _buttonStyle = new GUIStyle(GUI.skin.button)
         {
             fontSize = 15,
-            fixedHeight = 34
+            fixedHeight = 44
         };
 
         _labelStyle = new GUIStyle(GUI.skin.label)
@@ -1045,7 +1744,7 @@ public class GaussianChunkManager : MonoBehaviour
         if (hideLegacyOnGUIWhenXRActive && IsXRSceneActive())
             return;
 
-        if (!showModeSwitcherUI && !showDatasetSwitcherUI)
+        if (!showModeSwitcherUI && !showDatasetSwitcherUI && !showSamplingSwitcherUI && !showLodSwitcherUI)
             return;
 
         EnsureGUIStyles();
@@ -1053,8 +1752,12 @@ public class GaussianChunkManager : MonoBehaviour
         float panelHeight = 24f;
         if (showDatasetSwitcherUI)
             panelHeight += 128f;
+        if (showSamplingSwitcherUI)
+            panelHeight += 128f;
         if (showModeSwitcherUI)
             panelHeight += allowKeyboardToggle ? 150f : 124f;
+        if (showLodSwitcherUI)
+            panelHeight += allowKeyboardLodSwitch ? 206f : 180f;
 
         Rect panelRect = new Rect(16, 16, 320, panelHeight);
         GUILayout.BeginArea(panelRect, _panelStyle);
@@ -1066,13 +1769,32 @@ public class GaussianChunkManager : MonoBehaviour
 
             bool previousEnabled = GUI.enabled;
 
-            GUI.enabled = !MatchesDataset(indoorDataset);
+            GUI.enabled = !IsDataModeSelected(DatasetMode.Indoor);
             if (GUILayout.Button(indoorDataset.displayName, _buttonStyle))
                 SwitchToIndoorDataset();
 
-            GUI.enabled = !MatchesDataset(outdoorDataset);
+            GUI.enabled = !IsDataModeSelected(DatasetMode.Outdoor);
             if (GUILayout.Button(outdoorDataset.displayName, _buttonStyle))
                 SwitchToOutdoorDataset();
+
+            GUI.enabled = previousEnabled;
+            GUILayout.Space(8f);
+        }
+
+        if (showSamplingSwitcherUI)
+        {
+            GUILayout.Label("Sampling", _labelStyle);
+            GUILayout.Label($"Current: {(activeSamplingMode == SamplingMode.Uniform ? "Uniform" : "Random")}", _labelStyle);
+
+            bool previousEnabled = GUI.enabled;
+
+            GUI.enabled = !IsSamplingModeSelected(SamplingMode.Random);
+            if (GUILayout.Button("Random", _buttonStyle))
+                SwitchToRandomSampling();
+
+            GUI.enabled = !IsSamplingModeSelected(SamplingMode.Uniform);
+            if (GUILayout.Button("Uniform", _buttonStyle))
+                SwitchToUniformSampling();
 
             GUI.enabled = previousEnabled;
             GUILayout.Space(8f);
@@ -1091,6 +1813,30 @@ public class GaussianChunkManager : MonoBehaviour
 
             if (allowKeyboardToggle)
                 GUILayout.Label("Press Tab to switch view.", _labelStyle);
+        }
+
+        if (showLodSwitcherUI)
+        {
+            GUILayout.Space(8f);
+            GUILayout.Label("LOD Layer", _labelStyle);
+            GUILayout.Label($"Current: L{activeLodLevel}", _labelStyle);
+            GUILayout.Label(GetLODLayerInfoLabel(activeLodLevel), _labelStyle);
+
+            int[] levels = GetAvailableLodLevels();
+            GUILayout.BeginHorizontal();
+            for (int i = 0; i < levels.Length; i++)
+            {
+                int lod = levels[i];
+                bool previousEnabled = GUI.enabled;
+                GUI.enabled = activeLodLevel != lod;
+                if (GUILayout.Button($"L{lod}", _buttonStyle))
+                    SetActiveLODLevel(lod);
+                GUI.enabled = previousEnabled;
+            }
+            GUILayout.EndHorizontal();
+
+            if (allowKeyboardLodSwitch)
+                GUILayout.Label("Press 1-5 to switch LOD.", _labelStyle);
         }
 
         GUILayout.EndArea();
