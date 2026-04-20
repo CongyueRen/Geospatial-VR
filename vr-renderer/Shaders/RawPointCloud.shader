@@ -9,15 +9,15 @@ Shader "Unlit/RawPointCloud"
 
     SubShader
     {
-        Tags { "RenderType"="Transparent" "Queue"="Transparent" "RenderPipeline"="UniversalPipeline" }
+        Tags { "RenderType"="Opaque" "Queue"="Geometry" "RenderPipeline"="UniversalPipeline" }
 
         Pass
         {
             Name "RawPointCloud"
-            ZWrite Off
+            ZWrite On
             ZTest LEqual
             Cull Off
-            Blend SrcAlpha OneMinusSrcAlpha
+            Blend Off
 
             HLSLPROGRAM
             #pragma target 4.5
@@ -46,6 +46,7 @@ Shader "Unlit/RawPointCloud"
             {
                 float4 positionCS : SV_POSITION;
                 float4 color : COLOR;
+                float2 pointUV : TEXCOORD0;
             };
 
             float2 CornerUV(uint corner)
@@ -79,13 +80,15 @@ Shader "Unlit/RawPointCloud"
                 clipPos.xy += ndcOffset * clipPos.w;
 
                 output.positionCS = clipPos;
-                float3 rawColor = _Colors[pointIndex] * _Brightness;
-                output.color = float4(rawColor, 1.0) * _Tint;
+                output.pointUV = cornerUV;
+                float3 rawColor = saturate(_Colors[pointIndex] * _Brightness * _Tint.rgb);
+                output.color = float4(rawColor, 1.0);
                 return output;
             }
 
             half4 frag(Varyings input) : SV_Target
             {
+                clip(1.0 - dot(input.pointUV, input.pointUV));
                 return input.color;
             }
             ENDHLSL
